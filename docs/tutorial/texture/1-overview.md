@@ -55,7 +55,7 @@ pseudo-labeling all live on page 6 — and a seventh page runs them all from a s
    pseudo-label the result into a ready-to-train COCO / classification dataset (with optional
    captions).
 7. **[Agentic End-to-End Flow](7-agentic-end-to-end-flow.md)** — run all seven stages from one prompt
-   with the `anomalygen` agent skill.
+   with the `cdf-anomalygen` agent skill.
 
 Each stage feeds the next: the dataset from page 2 is placed into testcases on page 3, which train
 the model on page 4, whose checkpoint drives generation on page 5 — whose output is scored, refined

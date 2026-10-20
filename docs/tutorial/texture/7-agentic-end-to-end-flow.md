@@ -16,7 +16,7 @@ This is the seventh page of the CDF AnomalyGen texture tutorial series:
 7. **Agentic End-to-End Flow** ←
 
 Pages 2–6 run the pipeline one stage at a time. This page shows how to run the **whole pipeline from
-a single prompt** with an AI coding agent and this repo's `anomalygen` skill: you describe the run,
+a single prompt** with an AI coding agent and this repo's `cdf-anomalygen` skill: you describe the run,
 and the agent prepares the testcases, fine-tunes (or reuses a checkpoint), generates, evaluates,
 refines and pseudo-labels — then hands back the results.
 
@@ -35,7 +35,7 @@ ______________________________________________________________________
   checkpoints downloaded and `scripts/preflight_env_ckpt.sh` passing.
 - An AI coding agent that can load this repo's skills. The pipeline ships as agent skills under
   [`skills/`](../../../skills/); with Claude Code, start `claude` from the repo root and check that
-  `anomalygen` appears in the skill list.
+  `cdf-anomalygen` appears in the skill list.
 - **Model access for the default mask stage.** The skill's default `mask_backend=amg` (Agentic Mask
   Generation) needs a vision-language model, resolved through the registry
   `~/.anomalygen/endpoints.yaml` set up in

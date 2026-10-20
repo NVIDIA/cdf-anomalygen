@@ -2,7 +2,7 @@
   {
     "id": "1",
     "question": "I need to deploy AnomalyGen to a machine that has no internet access at runtime. Can you build an image for that?",
-    "expected_skill": "anomalygen-release",
+    "expected_skill": "cdf-anomalygen-release",
     "ground_truth": "Response recognizes this as an air-gapped scenario, so the checkpoints must be baked into the image, and selects TARGET=airgapped-product (or airgapped-develop). It uses docker buildx build with --build-context ckpts=./checkpoints, because a named context bypasses .dockerignore, and includes --load, explaining that without it the tag never reaches the local daemon and the subsequent docker save fails with \"reference does not exist\". It warns the build takes >1 h before starting, and notes ./checkpoints must already be populated via scripts/download_checkpoints.sh.",
     "expected_behavior": [
       "Response selects an airgapped-* target rather than develop or product.",
@@ -14,7 +14,7 @@
   {
     "id": "2",
     "question": "Build the anomalygen product container.",
-    "expected_skill": "anomalygen-release",
+    "expected_skill": "cdf-anomalygen-release",
     "ground_truth": "Response sets TARGET=product first and re-exports IMAGE so the tag follows the target, calling out that hardcoding develop in the tag while building --target product silently ships a product image labelled develop. It builds against docker/Dockerfile with --target \"$TARGET\" and then STOPS — push and run are opt-in and the user asked for neither. It verifies the product guardrails afterwards: ANOMALYGEN_PRODUCT_MODE=1 is set, the container runs as the non-root nvidia user, and the app code is read-only; if any of those fail the image is not productized.",
     "expected_behavior": [
       "Response sets TARGET=product and re-exports IMAGE so the tag matches the target.",
@@ -26,7 +26,7 @@
   {
     "id": "3",
     "question": "I just want to try AnomalyGen out on my workstation. What's the fastest way to get the container?",
-    "expected_skill": "anomalygen-release",
+    "expected_skill": "cdf-anomalygen-release",
     "ground_truth": "Response checks whether a build is needed at all and directs the user to the prebuilt image on NGC — docker pull nvcr.io/nvidia/cdf-anomalygen:<tag> needs no login and no compile — rather than starting a >1 h source build. It reserves building for the cases that actually require it: a modified image, a target NGC does not publish, or an air-gapped bundle. If it goes on to describe running the image, it includes --shm-size (min 16g), noting the dataloader uses /dev/shm and Docker's 64 MB default causes bus errors or silent hangs.",
     "expected_behavior": [
       "Response recommends pulling the prebuilt NGC image instead of building from source.",

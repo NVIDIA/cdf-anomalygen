@@ -9,7 +9,7 @@ NVIDIA <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-Developers and engineers building industrial defect-detection datasets use this skill to fine-tune the frozen Cosmos base into an anomaly-generation model and to produce, score, refine, and pseudo-label synthetic defect images from clean images and defect masks. <br>
+Developers and engineers building defect-detection systems use this skill to fine-tune the Cosmos base into an anomaly-generation model and produce synthetic defect images from clean images and defect masks, running any single stage or the full pipeline (mask placement, fine-tuning, generation, evaluation, refinement, and pseudo-labeling). <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
@@ -25,19 +25,19 @@ Risk: Review before execution as proposals could introduce incorrect or misleadi
 Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
-- [Agentic mask generation reference (Step 2, AMG)](references/agentic-mask-generation.md) <br>
-- [Mask-placement reference (Step 2, AMP)](references/mask-placement.md) <br>
-- [Fine-tuning reference (Step 3)](references/fine-tuning.md) <br>
-- [Quality-refinement reference (Step 6)](references/quality-refinement.md) <br>
+- [Agentic mask generation reference](references/agentic-mask-generation.md) <br>
+- [Fine-tuning reference](references/fine-tuning.md) <br>
 - [Inputs reference](references/inputs.md) <br>
-- [Verification reference (per-step gates)](references/verification.md) <br>
+- [Mask-placement reference (AMP)](references/mask-placement.md) <br>
+- [Quality-refinement reference](references/quality-refinement.md) <br>
+- [Verification reference](references/verification.md) <br>
 
 
 ## Skill Output: <br>
-**Output Type(s):** [Shell commands, Configuration instructions, Files] <br>
-**Output Format:** [Markdown with inline bash and YAML code blocks; pipeline artifacts on disk (testcase JSONL, checkpoints, generated images, KPI JSON, COCO annotations)] <br>
+**Output Type(s):** [Shell commands, Files, Analysis] <br>
+**Output Format:** [Markdown with inline bash code blocks; pipeline artifacts on disk (masks, testcase.jsonl, checkpoints, generated images, KPI JSON, COCO pseudo-labels)] <br>
 **Output Parameters:** [1D] <br>
-**Other Properties Related to Output:** [Each step is complete only when its named verification gate passes on the on-disk artifact] <br>
+**Other Properties Related to Output:** [Each step is complete only once its verification gate confirms the output artifact on disk] <br>
 
 ## Evaluation Agents Used: <br>
 - Claude Code (`aws/anthropic/bedrock-claude-opus-4-8`) <br>
@@ -46,23 +46,23 @@ Mitigation: Review and scan skill before deployment. <br>
 
 
 ## Evaluation Tasks: <br>
-5 evaluation tasks (5 positive), 1 attempt per task, each run in an isolated sandbox pod; evaluated with and without the skill for baseline comparison. <br>
+5 evaluation tasks (5 positive), 1 attempt per task, each run in an isolated sandbox pod and compared against a no-skill baseline. <br>
 
 ## Evaluation Metrics Used: <br>
 Reported benchmark dimensions: <br>
-- Security: Is it safe to use? Checks for unsafe operations, secret leakage, and unauthorized access. <br>
-- Correctness: Is the answer correct? Final-answer correctness against the reference answer. <br>
+- Security: Is it safe to use? <br>
+- Correctness: Is the answer correct? <br>
 - Discoverability: Was the right skill loaded when needed? <br>
-- Effectiveness: Did the skill help complete the task? Equal-weight mean of goal completion and expected workflow adherence. <br>
-- Efficiency: Did it avoid wasted tool calls and token usage? 50% tool-call productivity and 50% token efficiency. <br>
+- Effectiveness: Did the skill help complete the task? <br>
+- Efficiency: Did it avoid wasted tool calls and token usage? <br>
 
 Underlying evaluation signals used in this run: <br>
 - `security`: Unsafe operations, secret leakage, and unauthorized access. <br>
-- `accuracy`: Final-answer correctness against the reference answer. <br>
 - `skill_execution`: Whether the expected skill was selected, decoys were avoided, and the workflow executed. <br>
+- `skill_efficiency`: Tool-call productivity. <br>
+- `accuracy`: Final-answer correctness against the reference answer. <br>
 - `goal_accuracy`: Whether the user's goal was achieved. <br>
 - `behavior_check`: Whether the expected workflow behavior was followed. <br>
-- `skill_efficiency`: Tool-call productivity. <br>
 - `token_efficiency`: Actual uncached prompt plus completion usage. <br>
 
 
@@ -70,12 +70,12 @@ Underlying evaluation signals used in this run: <br>
 ## Evaluation Results: <br>
 | Measure | Claude Code (Baseline → Skill Uplift) | Codex (Baseline → Skill Uplift) |
 |---|---:|---:|
-| Overall | 75.2% — baseline ran, but no comparable score was available; uplift unavailable | 70.8% — baseline ran, but no comparable score was available; uplift unavailable |
-| Security | 100.0% → 100.0% (±0.0 points) | 80.0% → 100.0% (+20.0 points) |
-| Correctness | 0.0% → 64.0% (+64.0 points) | 0.0% → 48.0% (+48.0 points) |
-| Discoverability | 97.2% — baseline ran, but no comparable score was available; uplift unavailable | 92.0% — baseline ran, but no comparable score was available; uplift unavailable |
-| Effectiveness | 6.5% → 29.8% (+23.3 points) | 9.8% → 23.8% (+14.0 points) |
-| Efficiency | 84.8% — baseline ran, but no comparable score was available; uplift unavailable | 90.4% — baseline ran, but no comparable score was available; uplift unavailable |
+| Overall | 71.4% — baseline ran, but no comparable score was available; uplift unavailable | 71.1% — baseline ran, but no comparable score was available; uplift unavailable |
+| Security | 100.0% → 100.0% (±0.0 points) | 100.0% → 100.0% (±0.0 points) |
+| Correctness | 0.0% → 56.0% (+56.0 points) | 0.0% → 48.0% (+48.0 points) |
+| Discoverability | 98.0% — baseline ran, but no comparable score was available; uplift unavailable | 91.0% — baseline ran, but no comparable score was available; uplift unavailable |
+| Effectiveness | 6.5% → 17.8% (+11.3 points) | 4.5% → 20.7% (+16.2 points) |
+| Efficiency | 85.1% — baseline ran, but no comparable score was available; uplift unavailable | 95.7% — baseline ran, but no comparable score was available; uplift unavailable |
 
 ## Skill Version(s): <br>
 1.2.0 (source: frontmatter, pyproject.toml) <br>

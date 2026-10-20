@@ -1,4 +1,4 @@
-# Skill Benchmark: anomalygen-release
+# Skill Benchmark: cdf-anomalygen-release
 
 > ✅ **Overall verdict: PASS — Recommended for publication**
 
@@ -8,12 +8,12 @@ Recommended for publication based on the completed evaluation evidence in this r
 
 ## Evaluation Metadata
 
-- Skill: `anomalygen-release`
-- Evaluation date: 2026-10-08
+- Skill: `cdf-anomalygen-release`
+- Evaluation date: 2026-10-20
 - Evaluator version: `1.5.6`
 - Agents: Claude Code (`aws/anthropic/bedrock-claude-opus-4-8`), Codex (`openai/openai/gpt-5.5`)
 - Tasks: 3 evaluation tasks (3 positive)
-- Dataset digest: `sha256:7536231803fe8ce2774e3066e75a74d0c9e70cf5957d0f176dc460a9cfe37834` (skill-evaluator-dataset-snapshot/1)
+- Dataset digest: `sha256:76dfb65a830d8ab5ade84c6cd8418b6df6f703d0825eb03add58ca9a529925c0` (skill-evaluator-dataset-snapshot/1)
 - Attempts per task: 1
 - Environment: `k8s-sandbox`
 - Tier 2 evidence: required for publication
@@ -35,12 +35,12 @@ The three-tier evaluation checks whether the skill:
 
 | Measure | Claude Code (Baseline → Skill Uplift) | Codex (Baseline → Skill Uplift) |
 |---|---:|---:|
-| Overall | 92.2% — baseline ran, but no comparable score was available; uplift unavailable | 84.0% — baseline ran, but no comparable score was available; uplift unavailable |
+| Overall | 88.1% — baseline ran, but no comparable score was available; uplift unavailable | 81.5% — baseline ran, but no comparable score was available; uplift unavailable |
 | Security | 100.0% → 100.0% (±0.0 points) | 66.7% → 100.0% (+33.3 points) |
-| Correctness | 0.0% → 100.0% (+100.0 points) | 60.0% → 86.7% (+26.7 points) |
+| Correctness | 0.0% → 93.3% (+93.3 points) | 66.7% → 86.7% (+20.0 points) |
 | Discoverability | 100.0% — baseline ran, but no comparable score was available; uplift unavailable | 95.0% — baseline ran, but no comparable score was available; uplift unavailable |
-| Effectiveness | 8.3% → 69.2% (+60.9 points) | 42.5% → 57.5% (+15.0 points) |
-| Efficiency | 91.8% — baseline ran, but no comparable score was available; uplift unavailable | 80.9% — baseline ran, but no comparable score was available; uplift unavailable |
+| Effectiveness | 7.5% → 60.0% (+52.5 points) | 38.3% → 45.8% (+7.5 points) |
+| Efficiency | 86.9% — baseline ran, but no comparable score was available; uplift unavailable | 79.7% — baseline ran, but no comparable score was available; uplift unavailable |
 
 **How to read this table:** baseline is the same task attempted without the target skill. Scores are rounded to one decimal; threshold-adjacent values use additional precision so their displayed band matches the verdict. Uplift is derived from those displayed scores and shown in percentage points.
 
@@ -52,15 +52,15 @@ Actual Tier 3 execution usage is reported for every observed agent/case pair and
 
 | Agent | Dataset case | With skill | Without skill | Delta | Change | Coverage |
 |---|---|---:|---:|---:|---:|---|
-| claude-code | All cases | 505,756 | 487,813 | +17,943 | +3.68% | skill 3/3; base 3/3 |
-| claude-code | 1 | 241,383 | 153,530 | +87,853 | +57.22% | skill 1/1; base 1/1 |
-| claude-code | 2 | 201,570 | 214,739 | -13,169 | -6.13% | skill 1/1; base 1/1 |
-| claude-code | 3 | 62,803 | 119,544 | -56,741 | -47.46% | skill 1/1; base 1/1 |
-| codex | All cases | 216,667 | 1,068,924 | -852,257 | -79.73% | skill 3/3; base 3/3 |
-| codex | 1 | 105,552 | 901,067 | -795,515 | -88.29% | skill 1/1; base 1/1 |
-| codex | 2 | 64,139 | 129,050 | -64,911 | -50.30% | skill 1/1; base 1/1 |
-| codex | 3 | 46,976 | 38,807 | +8,169 | +21.05% | skill 1/1; base 1/1 |
-| ALL AGENTS | Dataset aggregate | 722,423 | 1,556,737 | -834,314 | -53.59% | skill 6/6; base 6/6 |
+| claude-code | All cases | 468,763 | 788,913 | -320,150 | -40.58% | skill 3/3; base 3/3 |
+| claude-code | 1 | 168,402 | 182,604 | -14,202 | -7.78% | skill 1/1; base 1/1 |
+| claude-code | 2 | 237,502 | 516,325 | -278,823 | -54.00% | skill 1/1; base 1/1 |
+| claude-code | 3 | 62,859 | 89,984 | -27,125 | -30.14% | skill 1/1; base 1/1 |
+| codex | All cases | 194,595 | 1,123,937 | -929,342 | -82.69% | skill 3/3; base 3/3 |
+| codex | 1 | 99,882 | 923,148 | -823,266 | -89.18% | skill 1/1; base 1/1 |
+| codex | 2 | 47,144 | 129,025 | -81,881 | -63.46% | skill 1/1; base 1/1 |
+| codex | 3 | 47,569 | 71,764 | -24,195 | -33.71% | skill 1/1; base 1/1 |
+| ALL AGENTS | Dataset aggregate | 663,358 | 1,912,850 | -1,249,492 | -65.32% | skill 6/6; base 6/6 |
 
 Prompt tokens include cached reads, so total tokens are `prompt + completion` (cached is not added twice). The Efficiency score uses `(prompt - cached) + completion`. N/A means the relevant trajectory counters were not available; coverage is never estimated.
 
@@ -68,7 +68,7 @@ Prompt tokens include cached reads, so total tokens are `prompt + completion` (c
 
 | Tier | Purpose | Status | Evidence |
 |---|---|---|---|
-| Tier 1 | Static validation | **PASSED WITH OBSERVATIONS** | 11 validator(s); 4 finding(s) |
+| Tier 1 | Static validation | **PASSED WITH OBSERVATIONS** | 11 validator(s); 5 finding(s) |
 | Tier 2 | Semantic deduplication | **PASSED** | 2 validator(s); 0 finding(s) |
 | Tier 3 | Live agent evaluation | **PASS** | 2 agent(s); 3 task(s) |
 
@@ -77,10 +77,11 @@ Prompt tokens include cached reads, so total tokens are `prompt + completion` (c
 <details>
 <summary>Show detailed findings and successful checks</summary>
 
+- **MEDIUM** SECURITY/Unknown (SDI-1): The manifest states the skill is 'Not for training or synthetic defect-image generation (SDG)' and the Purpose section r (`SKILL.md:160`)
 - **MEDIUM** SECURITY/Unknown (RP1): MCP Rug Pull: Docker image references without a specific tag (:latest is implicit) or digest (@sha256:...) can be silently replaced by (`references/running.md:12`)
-- **LOW** QUALITY/quality_discoverability: Description very long (216 chars, recommend 50-150) (`skills/anomalygen-release/SKILL.md`)
-- **LOW** QUALITY/quality_reliability: No limitations documented (`skills/anomalygen-release/SKILL.md`)
-- **LOW** SECURITY/Unknown (SDI-1): The manifest states the skill is "Not for training or synthetic defect-image generation (SDG)" and the Purpose section r (`SKILL.md:161`)
+- **LOW** QUALITY/quality_discoverability: Description very long (216 chars, recommend 50-150) (`skills/cdf-anomalygen-release/SKILL.md`)
+- **LOW** QUALITY/quality_reliability: No limitations documented (`skills/cdf-anomalygen-release/SKILL.md`)
+- **LOW** SECURITY/Unknown (SDI-2): The manifest description limits the skill to building the chosen Docker target from source and running it. Step 2 adds ` (`SKILL.md:126`)
 
 </details>
 

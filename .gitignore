@@ -220,3 +220,4 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+scripts/agentic_mask_generation_serving/endpoints.yaml

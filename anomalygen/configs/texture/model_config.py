@@ -3,89 +3,88 @@
 
 """``DiffusionExpertConfig`` extended with the I2I anomaly-inpainting knobs.
 
-With every flag at its default (all off), it behaves identically to the base config.
+With every flag at its default (all off), it behaves identically to the base config. Field groups
+mirror ``build_anomalygen_texture_ft_model_config``, which is what populates them; inference reads
+them back off the registered node instead of re-parsing the recipe.
 """
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Tuple
 
 import attrs
 from cosmos_framework.configs.base.defaults.model_config import DiffusionExpertConfig
 
-from anomalygen.configs.texture.constants import DEFAULT_MODEL_SIZE, DEFAULT_SHIFT
+from anomalygen.configs.texture.constants import (
+    DEFAULT_CROP_MODE,
+    DEFAULT_CROP_RATIO_RANGE,
+    DEFAULT_INPUT_SIZE_LADDER,
+    DEFAULT_MODEL_SIZE,
+)
+from anomalygen.data.utils import CAPTION_TOKEN_BUDGET
 
 
 @attrs.define(slots=False)
 class AnomalyGenTextureDiffusionExpertConfig(DiffusionExpertConfig):
     """``DiffusionExpertConfig`` + the I2I anomaly-inpainting knobs."""
 
-    # Model size this config was built for; recorded so inference can pick the matching base DCP off a
-    # registered node instead of re-parsing the recipe.
+    # --- backbone ---------------------------------------------------------------------------------
+
+    # Size this config was built for, so inference can pick the matching base DCP.
     model_size: str = DEFAULT_MODEL_SIZE
 
-    # Anomaly class metadata (shared): `anomaly_num_classes` sizes `inpaint_class_emb` and
-    # `text_prompt_emb`; `anomaly_types` are the ``[texture, defect]`` pairs in class-id order,
-    # used to rebuild each class's caption for the learnable text-prompt template init.
+    # `anomaly_num_classes` sizes `text_prompt_emb`; `anomaly_types` are the ``[texture, defect]``
+    # pairs in class-id order, used to rebuild each class's caption for the text-prompt template init.
     anomaly_num_classes: int = 0
     anomaly_types: List[List[str]] = attrs.field(factory=list)
 
-    # --- per-defect-type conditioning: four independent mechanisms; any subset stacks -------------
+    # --- per-defect-type conditioning: two independent mechanisms; either or both stack -----------
 
-    # 1) Per-defect-type learnable vision prompt item (`vision_prompt_emb`): a synthetic vision item
-    # prepended before the source, whose K tokens are a per-defect-type learnable set. Injected as a
-    # clean (no-noise, no-loss) conditioning item that both source and target attend to
-    # bidirectionally. Laid out on a square (1, side, side) token grid (K = side*side).
-    vision_prompt_item_enabled: bool = False
-    # Number of learnable vision-prompt tokens K; must be a perfect square (default 256 = 16x16).
-    vision_prompt_num_tokens: int = 256
-    # Freeze the vision prompt (keep it at its init; train only the other enabled mechanisms).
-    vision_prompt_freeze: bool = False
-
-    # 2) Per-defect-type LoRA on the gen-attention projections: each class gets its own stacked
-    # adapter, gen tokens are routed per forward, so all classes train in one mixed-batch run.
-    # Mutually exclusive with the shared ``lora_enabled`` (same targets). Needs
-    # ``use_cuda_graphs=False`` (the default) for compile-safe buffer routing.
+    # 1) Per-class LoRA on the gen-attention projections: each class gets its own stacked adapter and
+    # gen tokens are routed per forward, so all classes train in one mixed-batch run. Mutually
+    # exclusive with the shared ``lora_enabled`` (same targets). Needs ``cp_world_size=1`` so every
+    # gen row aligns with the routing vector.
     per_class_lora_enabled: bool = False
     per_class_lora_rank: int = 8
     per_class_lora_alpha: int = 8
 
-    # 3) Post-VAE per-defect-type additive hidden embedding (`inpaint_class_emb`).
-    inpaint_class_hidden_embed_enabled: bool = False
-
-    # 4) Per-defect-type learnable text prompt (`text_prompt_emb`): the whole text-token sequence becomes
-    # tunable, initialized from the caption template (padded to `text_prompt_num_tokens` with the
-    # `text_prompt_init_word` token).
+    # 2) Per-class learnable text prompt (`text_prompt_emb`): the whole text-token sequence becomes
+    # tunable, initialized from the caption template.
     learnable_text_prompt_enabled: bool = False
-    # Fixed learnable prompt length (= caption tokens emitted per sample). Default 512.
-    text_prompt_num_tokens: int = 512
-    # Word whose token embedding initializes the padded tail of each class's prompt.
+    # Fixed prompt length = caption tokens emitted per sample; the builder rejects anything above it.
+    text_prompt_num_tokens: int = CAPTION_TOKEN_BUDGET
+    # Token embedding that initializes the padded tail of each class's prompt.
     text_prompt_init_word: str = "anomaly"
-    # Freeze the learnable prompt (keep it at its template init; train only the other mechanisms).
-    text_prompt_freeze: bool = False
+
+    # --- inpainting -------------------------------------------------------------------------------
 
     # Latent edit-mask downsampling: "any" (max-pool any-touch, keeps thin defects) | "nearest".
     inpaint_latent_mask_mode: str = "any"
 
-    # Mask-emphasised flow-matching loss: extra supervision inside the defect region.
-    inpaint_loss_mask_emphasis: bool = False
-    inpaint_loss_mask_max_adaptive_weight: float = 100.0
+    # Weight on the background term of the region-split loss (see ``masked_flow_matching_loss``); the
+    # defect term is always unweighted. 0.0 = defect-only. Both terms are per-region means, so 1.0
+    # makes one cell of background error count as much as one of defect error — a far stronger
+    # background pull than the base whole-image loss applied.
+    inpaint_loss_background_weight: float = 0.0
 
-    # Replacement trick at inference: latent hard-composite outside the mask each denoising step.
+    # Latent hard-composite outside the mask at every denoising step (inference).
     inpaint_replacement_trick: bool = False
 
-    # Distributed parallelism mode, mirroring ``trainer.distributed_parallelism``: "ddp" (default,
-    # each rank keeps the full model) or "fsdp" (shard params/optimizer). Read by
-    # ``AnomalyGenTextureMoTModel.set_up_parallelism``: under "ddp" it skips fully_shard so the DDP
-    # wrapper can broadcast plain-tensor params.
+    # --- crop geometry: recorded by the experiment builder so generation mirrors training ---------
+
+    # Where the framing comes from: "scale" (context + resample axes) or "ratio" (context axis only).
+    crop_mode: str = DEFAULT_CROP_MODE
+    # A single-size ladder is how you pin one fixed model input size.
+    input_size_ladder: List[int] = attrs.field(factory=lambda: list(DEFAULT_INPUT_SIZE_LADDER))
+    # Trained framing band; inference clamps a testcase's ``crop_ratio`` into it and reads the low
+    # bound as the framing floor.
+    crop_ratio_range: Tuple[float, float] = DEFAULT_CROP_RATIO_RANGE
+    # "scale" mode only; unused under "ratio", where the framing has no scale axis.
+    inference_scale: float = 1.0
+
+    # --- runtime ----------------------------------------------------------------------------------
+
+    # Mirrors ``trainer.distributed_parallelism``: "ddp" (each rank keeps the full model) or "fsdp"
+    # (shard params/optimizer). Read by ``AnomalyGenTextureMoTModel.set_up_parallelism``, which under
+    # "ddp" skips fully_shard so the DDP wrapper can broadcast plain-tensor params.
     parallelism: str = "ddp"
-
-    # Square pixel size crops are resized to before generation — the model's one input size, shared by
-    # standalone inference (generate.py) and validation.
-    model_input_size: int = 512
-
-    # Validation-generation fallbacks, read by ``AnomalyGenTextureMoTModel.validation_step`` only when
-    # a testcase omits the value: ``val_shift`` is the sampler time-shift; ``val_crop`` is the
-    # fixed crop-grid used when a testcase omits ``crop_ratio``.
-    val_shift: float = DEFAULT_SHIFT
-    val_crop: int = 512

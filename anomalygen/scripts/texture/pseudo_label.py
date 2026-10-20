@@ -37,7 +37,9 @@ from typing import Any, Dict
 from cosmos_framework.inference.common.init import init_script
 from cosmos_framework.utils import log
 
-init_script(training=False)
+# Guarded because it disables autograd process-wide; importing this module must leave it alone.
+if __name__ == "__main__":
+    init_script(training=False)
 
 import numpy as np
 import yaml
@@ -45,7 +47,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from anomalygen.configs.texture.constants import DEFAULT_MAX_INSTANCES
-from anomalygen.data.utils import validate_anomaly_type
+from anomalygen.data.utils import require_same_size, validate_anomaly_type
 from anomalygen.eval.utils import MASK_SUBDIR, ORIG_IMAGE_SUBDIR, RECON_SUBDIR
 from anomalygen.inference.iterative import split_mask_into_instances
 from anomalygen.pseudo_label import bbox as pl_bbox
@@ -223,6 +225,8 @@ def main(argv=None) -> None:
         anomaly_type = anomaly_type_map[gen_image_filename]
         generated_image = Image.open(gen_image_path).convert("RGB")
         mask = Image.open(mask_path).convert("L")
+        # The COCO record's width/height come from the mask, the bboxes from the generated image.
+        require_same_size(generated_image, mask, f"{gen_image_path} + {mask_path}")
         instance_masks = split_mask_into_instances(mask, max_k=int(args.max_instances))
         bboxes = pl_bbox.get_bboxes(instance_masks)
 

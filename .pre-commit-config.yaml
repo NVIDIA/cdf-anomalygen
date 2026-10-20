@@ -6,7 +6,9 @@ default_language_version:
 # NVCARPS-CI generates BENCHMARK.md / skill-card.md and then signs the skill folder, so those files
 # are part of the signed content. The generated license file and the verbatim legal texts are
 # excluded for the same reason: reformatting them would rewrite content we do not author, and
-# addlicense must not stamp an NVIDIA SPDX header onto third-party license texts.
+# addlicense must not stamp an NVIDIA SPDX header onto third-party license texts. The DCO text in
+# CONTRIBUTING.md is verbatim too but shares a file with prose, so an inline rumdl-disable guard
+# scoped to the rules it trips protects that section instead of an exclude.
 exclude: (?x)(
     ^tests/data/|
     ^skills/[^/]+/(BENCHMARK\.md|skill-card\.md|skill\.oms\.sig)$|
@@ -22,7 +24,7 @@ repos:
     hooks:
       - id: gitleaks
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.3
+    rev: v0.16.7
     hooks:
       - id: ruff-check
         args: ["--fix"]
@@ -36,9 +38,9 @@ repos:
     rev: v1.2.0
     hooks:
       - id: addlicense
-        args: ["-f", "ci/license.txt"]
+        args: ["-f", "ci/license-header.txt"]
   - repo: https://github.com/rvben/rumdl-pre-commit
-    rev: v0.2.55
+    rev: v0.2.60
     hooks:
       - id: rumdl-fmt
   - repo: https://github.com/tcort/markdown-link-check

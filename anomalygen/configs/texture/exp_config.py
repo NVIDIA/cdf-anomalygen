@@ -3,18 +3,25 @@
 
 """Reusable config builders for the texture I2I anomaly-inpainting experiment.
 
-A recipe (e.g. ``ag_config/exp_texture_ft_phone_screen.yaml``) only needs to supply the
-dataset-specific values (paths, ``anomaly_types``, ``dataset_name``) and call
-``build_anomalygen_texture_ft_experiment`` to get the full experiment ``LazyDict`` to ``cs.store``.
-Architecture knobs that define *what the texture model is* (any-touch latent mask, replacement
-trick, mask-emphasis weight, LoRA target modules) live here, not in the recipe; the commonly
-tuned values are ``build_anomalygen_texture_ft_experiment`` parameters with sensible defaults — paths,
-anomaly types, schedule (``max_iter``/``validation_iter``/``cycle_lengths``/``warm_up_steps``),
-optimizer (``lr``/``betas``/``eps``/``weight_decay``), data (``batch_size``/``num_workers``/
-``ratio_range``/``image_size``), early stop, ``logging_iter``, ``seed``, etc.
+A recipe (e.g. ``ag_config/exp_texture_ft_phone_screen.yaml``) supplies the dataset-specific values
+(paths, ``anomaly_types``, ``dataset_name``) and calls ``build_anomalygen_texture_ft_experiment`` to
+get the full experiment ``LazyDict`` to ``cs.store``. Two layers:
 
-``ANOMALYGEN_PARALLELISM`` (ddp/fsdp) and ``ANOMALYGEN_COMPILE`` (0/1) are read from the environment
-here so the documented launch command is unchanged.
+* ``build_anomalygen_texture_ft_model_config`` — what the model *is*: architecture, adapters, loss,
+  and the crop geometry the trained weights are only valid under. Also used at inference.
+* ``build_anomalygen_texture_ft_experiment`` — that config plus everything needed to *train* it:
+  data paths, dataloaders, optimizer, scheduler, trainer schedule, callbacks, checkpointing.
+
+Fixed architecture choices (any-touch latent mask, replacement trick, LoRA target modules) are
+hard-coded here rather than exposed; everything commonly tuned is a keyword argument with a default.
+
+``crop_mode`` sets how each window is framed; every sample is then cut onto an input size drawn from
+``input_size_ladder`` (a single-size ladder pins one fixed input size). A step is bounded by
+``max_sequence_length`` (a token budget), so samples per step vary with the sizes drawn; set it to
+None to batch by ``batch_size`` instead.
+
+Env overrides, so the documented launch command is unchanged: ``ANOMALYGEN_PARALLELISM`` (ddp/fsdp),
+``ANOMALYGEN_COMPILE`` (0/1).
 """
 
 from __future__ import annotations
@@ -23,26 +30,38 @@ import copy
 import inspect
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence
 
 from cosmos_framework.configs.base.experiment.sft.models.edge_model_config import EDGE_MODEL_CONFIG
 from cosmos_framework.configs.base.experiment.sft.models.nano_model_config import NANO_MODEL_CONFIG
 from cosmos_framework.data.generator.joint_dataloader import PackingDataLoader, RankPartitionedDataLoader
+from cosmos_framework.utils import log
 from cosmos_framework.utils.lazy_config import LazyCall as L
 from cosmos_framework.utils.lazy_config import LazyDict
 
 from anomalygen.checkpoint.trained_keys import TRAINED_KEY_PREFIXES, WARM_START_SKIP_PREFIXES
 from anomalygen.configs.texture.constants import (
+    AC_MODES,
     BASE_CHECKPOINT_PATHS,
+    COMPILE_RECOMPILE_LIMIT,
+    DEFAULT_AC_MODE,
+    DEFAULT_CROP_MODE,
+    DEFAULT_CROP_RATIO_RANGE,
+    DEFAULT_INPUT_SIZE_LADDER,
     DEFAULT_MODEL_SIZE,
+    DEFAULT_SCALE_RANGE,
     DEFAULT_SHIFT,
     MODEL_SIZES,
+    PATCH_SPATIAL,
+    VAE_SPATIAL_COMPRESSION,
 )
+from anomalygen.data.crop_geometry import validate_geometry
 from anomalygen.data.inpaint_inference_dataset import get_inpaint_val_dataloader
 from anomalygen.data.inpainting_dataset import get_inpainting_dataset
+from anomalygen.data.utils import CAPTION_TOKEN_BUDGET, anomalygen_collate_fn, sample_token_count
 
-# Frozen base ``model.config`` per size. Framework constants: deep-copy before mutating, which
-# ``_base_model_config`` is the only place to do.
+# Frozen base ``model.config`` per size. Framework constants — deep-copy before mutating, which
+# ``_base_model_config`` is the only place that does.
 _SIZE_MODEL_CONFIGS = {
     "nano": NANO_MODEL_CONFIG,
     "edge": EDGE_MODEL_CONFIG,
@@ -56,9 +75,8 @@ def _base_model_config(model_size: str) -> dict:
     return copy.deepcopy(_SIZE_MODEL_CONFIGS[model_size])
 
 
-# Repo root, derived from this module's location (anomalygen/configs/texture/exp_config.py). Used to
-# absolutize recipe-supplied relative paths: training chdir's to the framework checkout root for the
-# model build, so dataset / checkpoint / VAE paths must be absolute to survive that.
+# Repo root, derived from this module's location. Recipe-supplied relative paths are absolutized
+# against it because training chdir's to the framework checkout for the model build.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -68,246 +86,290 @@ def _abs(path: str) -> str:
 
 
 def build_anomalygen_texture_ft_model_config(
-    num_classes: int,
+    anomaly_num_classes: int,
     vae_path: str,
     *,
+    # --- backbone ---
+    model_size: str = DEFAULT_MODEL_SIZE,
     anomaly_types: Sequence[Sequence[str]] = (),
+    # --- global LoRA (all classes share one adapter) ---
     lora_enabled: bool = False,
     lora_rank: int = 32,
     lora_alpha: int = 32,
-    resolution: str = "480",
-    vision_prompt_item_enabled: bool = False,
-    vision_prompt_num_tokens: int = 256,
-    vision_prompt_freeze: bool = False,
+    # --- per-defect-type LoRA (routed per gen token) ---
     per_class_lora_enabled: bool = True,
     per_class_lora_rank: int = 8,
     per_class_lora_alpha: int = 8,
-    inpaint_class_hidden_embed_enabled: bool = False,
+    # --- per-defect-type learnable text prompt ---
     learnable_text_prompt_enabled: bool = False,
-    text_prompt_num_tokens: int = 512,
+    text_prompt_num_tokens: int = CAPTION_TOKEN_BUDGET,
     text_prompt_init_word: str = "anomaly",
-    text_prompt_freeze: bool = False,
-    model_input_size: int = 512,
+    # --- loss ---
+    inpaint_loss_background_weight: float = 0.0,
+    # --- sampler + crop geometry (published so generation mirrors training) ---
     shift: float = DEFAULT_SHIFT,
-    crop: int = 512,
+    crop_mode: str = DEFAULT_CROP_MODE,
+    input_size_ladder: Sequence[int] = DEFAULT_INPUT_SIZE_LADDER,
+    crop_ratio_range: Sequence[float] = DEFAULT_CROP_RATIO_RANGE,
+    inference_scale: float = 1.0,
+    # --- runtime ---
+    activation_checkpointing_mode: str = DEFAULT_AC_MODE,
     parallelism: str = "ddp",
-    model_size: str = DEFAULT_MODEL_SIZE,
 ) -> dict:
-    """Base model config for the size + the texture anomaly-inpainting overrides.
+    """Base model config for ``model_size`` plus the texture anomaly-inpainting overrides.
 
-    Deep-copies the ``model_size`` baseline (``nano`` -> Qwen3-VL-8B, ``edge`` -> Nemotron-3 Dense
-    VL 2B) so the vlm_config / tokenizer / net wiring is inherited rather than restated; everything
-    overridden below is size-independent. ``resolution`` selects the sampler time-shift
-    (480 -> 5.0; 720 -> 10.0).
+    Deep-copies the size baseline (``nano`` -> Qwen3-VL-8B, ``edge`` -> Nemotron-3 Dense VL 2B) so
+    the vlm_config / tokenizer / net wiring is inherited; every override below is size-independent.
 
-    The four per-defect-type conditioning mechanisms are independent and stack — any subset may be
-    enabled at once: the learnable vision prompt item (``vision_prompt_item_enabled``), the
-    per-defect-type LoRA (``per_class_lora_enabled``), the additive hidden embedding
-    (``inpaint_class_hidden_embed_enabled``), and the learnable text prompt
-    (``learnable_text_prompt_enabled``).
+    The two per-defect-type conditioning mechanisms — per-class LoRA and the learnable text prompt —
+    are independent and stack; either or both may be on.
     """
     cfg = _base_model_config(model_size)
     cfg["lora_enabled"] = lora_enabled
     cfg["lora_rank"] = lora_rank
     cfg["lora_alpha"] = lora_alpha
     cfg["lora_target_modules"] = "q_proj_moe_gen,k_proj_moe_gen,v_proj_moe_gen,o_proj_moe_gen"
-    cfg["resolution"] = resolution  # selects the sampler time-shift
 
     _dec = cfg.setdefault("diffusion_expert_config", {})
     # Recorded so inference can read the size off a registered node (see inference/inpaint.py).
     _dec["model_size"] = model_size
-    _dec["anomaly_num_classes"] = num_classes
+    _dec["anomaly_num_classes"] = anomaly_num_classes
     _dec["anomaly_types"] = [list(p) for p in anomaly_types]
     _dec["inpaint_latent_mask_mode"] = "any"
-    _dec["inpaint_loss_mask_emphasis"] = True
-    _dec["inpaint_loss_mask_max_adaptive_weight"] = 100.0
+    _dec["inpaint_loss_background_weight"] = inpaint_loss_background_weight
     _dec["inpaint_replacement_trick"] = True
-    # Per-defect-type conditioning — four independent mechanisms (any subset stacks).
-    # 1) Per-defect-type learnable vision prompt item (a clean square-grid item prepended before source).
-    _dec["vision_prompt_item_enabled"] = vision_prompt_item_enabled
-    _dec["vision_prompt_num_tokens"] = vision_prompt_num_tokens
-    _dec["vision_prompt_freeze"] = vision_prompt_freeze
-    # 2) Per-defect-type LoRA on the gen-expert attention projections (routed per gen token).
+    # Per-class LoRA on the gen-expert attention projections.
     _dec["per_class_lora_enabled"] = per_class_lora_enabled
     _dec["per_class_lora_rank"] = per_class_lora_rank
     _dec["per_class_lora_alpha"] = per_class_lora_alpha
-    # 3) Post-VAE per-defect-type additive hidden embedding.
-    _dec["inpaint_class_hidden_embed_enabled"] = inpaint_class_hidden_embed_enabled
-    # 4) Per-defect-type learnable text prompt (whole text sequence tunable, template-initialized).
+    # Learnable text prompt: whole text sequence tunable, template-initialized.
     _dec["learnable_text_prompt_enabled"] = learnable_text_prompt_enabled
     _dec["text_prompt_num_tokens"] = text_prompt_num_tokens
     _dec["text_prompt_init_word"] = text_prompt_init_word
-    _dec["text_prompt_freeze"] = text_prompt_freeze
-    # Distributed parallelism mode ("ddp"/"fsdp"), read by set_up_parallelism: "ddp" skips
-    # fully_shard so each rank keeps the full model for the DDP wrapper to broadcast.
+    # Read by set_up_parallelism: "ddp" skips fully_shard so each rank keeps the full model for the
+    # DDP wrapper to broadcast.
     _dec["parallelism"] = parallelism
-    # Generation params read by validation_step (class_ids is derived from anomaly_types).
-    # model_input_size is the model's one input size (not val-specific); val_shift/val_crop are
-    # per-testcase fallbacks.
-    _dec["model_input_size"] = model_input_size
-    _dec["val_shift"] = shift
-    _dec["val_crop"] = crop
+    # Trained crop mode / input-size / framing bands, published so generation mirrors training.
+    _dec["crop_mode"] = crop_mode
+    _dec["input_size_ladder"] = [int(v) for v in input_size_ladder]
+    _dec["crop_ratio_range"] = (float(crop_ratio_range[0]), float(crop_ratio_range[1]))
+    _dec["inference_scale"] = inference_scale
 
-    # Point the VAE tokenizer at the local checkpoint (overrides the framework's relative default).
+    # One scalar shift for every input size, replacing the framework's per-resolution dict. Must be an
+    # int: the framework takes the scalar path on ``isinstance(shift, int)`` and reads a float as a dict.
+    if int(shift) != shift:
+        raise ValueError(f"shift must be a whole number, got {shift}.")
+    cfg["rectified_flow_training_config"]["shift"] = int(shift)
+
+    # Local VAE checkpoint, overriding the framework's relative default.
     cfg["tokenizer"]["vae_path"] = vae_path
-    # Disable the model-level EMA. The nano base enables it, which makes the model build a second,
-    # float32 copy of the network (net_ema) — ~2x the bf16 net, the bulk of single-GPU memory. We
-    # don't use EMA here (trainer `/ema` is overridden to None and net_ema. is skipped at load),
-    # so turning it off keeps only the bf16 net resident and lets the model fit one GPU under DDP.
+    # Disable the model-level EMA (on in the nano base). It builds a second, float32 copy of the net
+    # — ~2x the bf16 net and the bulk of single-GPU memory — that we never use (trainer `/ema` is
+    # None and net_ema. is skipped at load). Off, the model fits one GPU under DDP.
     cfg["ema"]["enabled"] = False
-    # torch.compile is env-gated: ON by default, set ANOMALYGEN_COMPILE=0 to disable.
-    # The nano base ships enabled=True with compiled_region="language", which compiles ONLY the MoT
-    # transformer blocks (parallelize_unified_mot.apply_compile) — the heavy compute. Those blocks take
-    # the packed-sequence tensor as input and never read the live inpaint context, so the side-channel
-    # (network.set_anomaly_context) does NOT force recompiles there. The recompile / stale-context
-    # hazard only arises at compiled_region="all", which additionally compiles the encode/decode heads,
-    # including our _encode_vision injection. We keep "language", so the head (and its per-defect-type additive
-    # embed) stays eager and enabling compile is safe. The USE_TORCH_COMPILE env var is not read
-    # anywhere; this flag is the switch.
+    # torch.compile: ON by default, ANOMALYGEN_COMPILE=0 disables. (USE_TORCH_COMPILE is not read.)
     cfg["compile"]["enabled"] = os.environ.get("ANOMALYGEN_COMPILE", "1").strip() == "1"
-    # Pin the region to "language" (inherited from nano) so the recipe is self-documenting: compile the
-    # transformer blocks, never the encode/decode heads where the eager inpaint-context injection lives.
+    # "language" compiles only the MoT transformer blocks — the heavy compute. They take the packed
+    # sequence as input and never read the live inpaint context, so network.set_anomaly_context
+    # forces no recompiles. "all" would also compile the encode/decode heads, where our
+    # _encode_text / _encode_vision injections live: stale context + recompiles. Pinned, not inherited.
     cfg["compile"]["compiled_region"] = "language"
     if cfg["compile"].get("compiled_region") not in (None, "language"):
         raise ValueError("AnomalyGen Texture FT requires compiled_region in {None, 'language'}")
-    # Auto-select the FSDP shard degree from the torchrun world size so one recipe scales to any
-    # GPU count (ignored under DDP). The nano base pins it to 8.
+    # Activation checkpointing for the MoT blocks. The size baselines ship "full" for long video
+    # sequences; a step here packs at most ``max_sequence_length`` tokens and does not need it.
+    if activation_checkpointing_mode not in AC_MODES:
+        raise ValueError(
+            f"activation_checkpointing_mode must be one of {AC_MODES}, got {activation_checkpointing_mode!r}."
+        )
+    cfg["activation_checkpointing"]["mode"] = activation_checkpointing_mode
+    # Derive the FSDP shard degree from the torchrun world size (nano pins 8) so one recipe scales to
+    # any GPU count. Ignored under DDP.
     cfg["parallelism"]["data_parallel_shard_degree"] = -1
     return cfg
 
 
 def build_anomalygen_texture_ft_experiment(
     *,
+    # --- identity ---
     dataset_name: str,
-    job_name: str = "anomalygen_texture_ft",
     anomaly_types: Sequence[Sequence[str]],
+    job_name: str = "anomalygen_texture_ft",
+    # Caller's own file, snapshotted into the run dir by TrainingReport. Defaults to the caller.
+    recipe_path: Optional[str] = None,
+    # --- data + checkpoint paths (repo-root-relative or absolute) ---
     dataset_path: str,
     testcase_jsonl: str,
-    recipe_path: Optional[str] = None,
-    # Frozen backbone size ("nano" | "edge"); also picks base_checkpoint_path when it is omitted.
+    # Frozen backbone size ("nano" | "edge"); also picks base_checkpoint_path when that is omitted.
     model_size: str = DEFAULT_MODEL_SIZE,
     base_checkpoint_path: Optional[str] = None,
     vae_path: Optional[str] = None,
-    image_size: Tuple[int, int] = (512, 512),
+    # --- global LoRA (all classes share one adapter) ---
+    lora_enabled: bool = False,
+    lora_rank: int = 32,
+    lora_alpha: int = 32,
+    # --- per-defect-type LoRA (routed per gen token; all classes in one mixed-batch run) ---
+    per_class_lora_enabled: bool = True,
+    per_class_lora_rank: int = 8,
+    per_class_lora_alpha: int = 8,
+    # --- per-defect-type learnable text prompt (stacks with the per-class LoRA) ---
+    learnable_text_prompt_enabled: bool = False,
+    text_prompt_num_tokens: int = CAPTION_TOKEN_BUDGET,
+    text_prompt_init_word: str = "anomaly",
+    # --- loss ---
+    # Weight on the background term; the defect term is always unweighted. 0.0 = defect-only.
+    inpaint_loss_background_weight: float = 0.0,
+    # --- sampler + crop geometry ---
+    shift: float = DEFAULT_SHIFT,
+    # Where the framing comes from: "scale" (crop_ratio_range + scale_range) or "ratio"
+    # (crop_ratio_range alone, so scale_range and inference_scale are unused).
+    crop_mode: str = DEFAULT_CROP_MODE,
+    # FRAMING axis: context multiplier — the window is bbox * ratio, so the defect fills 1/ratio of it.
+    # Under crop_mode="ratio" this is the only framing axis.
+    crop_ratio_range: Sequence[float] = DEFAULT_CROP_RATIO_RANGE,
+    # SCALE axis ("scale" crop mode only): the defect's apparent pixel size (bbox * s), drawn LOG-uniformly
+    # as an augmentation (a linear draw would over-weight upscaling and sit training above
+    # inference_scale). Orthogonal to crop_ratio_range. See RandomScaleCrop.
+    scale_range: Sequence[float] = DEFAULT_SCALE_RANGE,
+    # Legal per-axis input sizes in pixels; each axis snaps to one. Multiples of 32 (one vision
+    # token) — validated and sorted below. A single entry pins one fixed input size.
+    input_size_ladder: Sequence[int] = DEFAULT_INPUT_SIZE_LADDER,
+    # Scale used at GENERATION time ("scale" crop mode only); 1.0 = native pixels. Must sit inside scale_range.
+    inference_scale: float = 1.0,
+    # --- data loading ---
+    # Token budget per packed step; this, not batch_size, is the training batch (the framework
+    # accepts exactly one of the two). Bounds activation memory, which under variable input sizes
+    # tracks the sizes drawn rather than a sample count. None => batch by sample count.
+    max_sequence_length: Optional[int] = 5120,
+    # Inner DataLoader per-pull size, and the training batch only when max_sequence_length is None.
+    batch_size: int = 4,
+    validation_batch_size: int = 16,
+    num_workers: int = 4,
+    # --- runtime ---
+    # Activation checkpointing for the MoT blocks: "none" | "selective" | "full". Trades recompute
+    # for memory and changes nothing the model trains on, so it is the first knob to raise on an OOM.
+    activation_checkpointing_mode: str = DEFAULT_AC_MODE,
+    # --- augmentation (per-sample probability; 0 = off) ---
+    # Drop the training source item's background to -1 (black); the defect region is noise either
+    # way. Training-only — inference always keeps the background.
+    background_dropout_prob: float = 0.0,
+    # Keep one defect instance, blacking the dropped ones out in the image.
+    inst_aug_prob: float = 0.2,
+    # Recolour a band around the defect (band width stays on $ANOMALYGEN_RING_JITTER_PX).
+    ring_jitter_prob: float = 0.0,
+    # --- optimizer (AdamW) ---
+    lr: float = 1.0e-03,
+    betas: Sequence[float] = (0.9, 0.95),
+    eps: float = 1.0e-06,
+    weight_decay: float = 0.0,
+    # Name-substring -> factor on the base ``lr``, applied by the framework optimizer to any param
+    # whose name contains it; e.g. give the learnable text prompt a larger step. Empty => uniform LR.
+    lr_multipliers: Optional[Dict[str, float]] = None,
+    # --- LambdaCosine scheduler (single warmup -> cosine-decay cycle) ---
+    cycle_lengths: int = 15000,
+    warm_up_steps: int = 500,
+    # --- trainer schedule ---
     max_iter: int = 15000,
     validation_iter: int = 1000,
     run_validation_on_start: bool = True,
     save_iter: int = 1000,
-    lr: float = 1.0e-03,
-    model_input_size: int = 512,
-    shift: float = DEFAULT_SHIFT,
-    # model / LoRA
-    lora_enabled: bool = False,
-    lora_rank: int = 32,
-    lora_alpha: int = 32,
-    # per-defect-type conditioning methods (independent; any subset stacks)
-    vision_prompt_item_enabled: bool = False,
-    vision_prompt_num_tokens: int = 256,
-    vision_prompt_freeze: bool = False,
-    # per-defect-type LoRA (routed per gen token; trains all classes in one mixed-batch run)
-    per_class_lora_enabled: bool = True,
-    per_class_lora_rank: int = 8,
-    per_class_lora_alpha: int = 8,
-    inpaint_class_hidden_embed_enabled: bool = False,
-    learnable_text_prompt_enabled: bool = False,
-    text_prompt_num_tokens: int = 512,
-    text_prompt_init_word: str = "anomaly",
-    text_prompt_freeze: bool = False,
-    # optimizer (AdamW)
-    betas: Sequence[float] = (0.9, 0.95),
-    eps: float = 1.0e-06,
-    weight_decay: float = 0.0,
-    # Per-key LR multipliers: name-substring -> factor on the base ``lr`` (empty => all trained
-    # params share the base LR). Applied by the framework optimizer to any param whose name
-    # contains the substring; useful to e.g. give the learnable text prompt a larger step.
-    lr_multipliers: Optional[Dict[str, float]] = None,
-    # LambdaCosine scheduler (single warmup -> cosine-decay cycle)
-    cycle_lengths: int = 15000,
-    warm_up_steps: int = 500,
-    # trainer
     logging_iter: int = 10,
     seed: int = 42,
-    # validation metrics: anomaly-quality axes (completeness/precision/boundary_iou) + the aq_nn
-    # composite (= completeness + nn_score) are on by default; set False to skip their per-validation
-    # SAM2 load (see anomalygen.eval.anomaly_quality).
+    # --- validation metrics ---
+    # Anomaly-quality axes (completeness/precision/boundary_iou) + the aq_nn composite
+    # (= completeness + nn_score). False skips their per-validation SAM2 load.
     compute_anomaly_quality: bool = True,
-    # early stopping (disabled by default)
+    # --- early stopping (off by default) ---
     early_stop_enabled: bool = False,
     early_stop_metric: str = "nn",
     early_stop_patience: int = 5,
     early_stop_min_delta: float = 0.0,
     early_stop_min_delta_mode: str = "rel",
-    # data
-    batch_size: int = 4,
-    validation_batch_size: int = 16,
-    num_workers: int = 4,
-    ratio_range: Sequence[float] = (1.5, 8.0),
-    # Per-sample prob the training source item's background is dropped to -1 (black; defect region is noise
-    # either way); training-only, inference always keeps the background.
-    background_dropout_prob: float = 0.5,
-    # Per-sample prob of the keep-one-instance augmentation (drop all but one defect instance,
-    # blacking the dropped ones out in the image). 0 = off.
-    inst_aug_prob: float = 0.5,
-    # Per-sample prob of the ring colour jitter (recolour a band around the defect; the band width
-    # itself stays on $ANOMALYGEN_RING_JITTER_PX). 0 = off.
-    ring_jitter_prob: float = 0.5,
 ) -> LazyDict:
     """Assemble the full ``anomalygen_texture_ft`` experiment ``LazyDict`` for a texture dataset.
 
     The caller (a recipe) supplies the dataset-specific values and then ``cs.store``s the result.
-    ``anomaly_types`` is a list of ``[texture, defect]`` pairs; ``num_classes`` and the
-    ``"{texture}+{defect}" -> id`` map are derived from it. ``recipe_path`` is the caller's own
-    file path, copied into the run dir by the TrainingReport callback.
+    ``anomaly_types`` is a list of ``[texture, defect]`` pairs. It is sorted and deduplicated here, so
+    the class ids (its positions) do not depend on the order a recipe lists them; the checkpoint
+    stamps the sorted list and generation reads the ids back off it.
     """
-    # Absolutize all paths against the repo root (recipes may pass repo-root-relative paths, but the
-    # model build runs under a chdir to the framework root). base_checkpoint_path / vae_path default
-    # to the repo-root checkpoints/ tree when a recipe omits them.
+    # Absolutize every path: recipes may pass repo-root-relative ones, but the model build runs under
+    # a chdir to the framework root. The YAML/JSON loader passes recipe_path explicitly; a .py recipe
+    # relies on the caller-frame default.
     dataset_path = _abs(dataset_path)
     testcase_jsonl = _abs(testcase_jsonl)
-    # recipe_path defaults to the calling recipe module's own file (so TrainingReport snapshots it);
-    # the YAML/JSON loader passes the recipe file explicitly.
     recipe_path = _abs(recipe_path or inspect.stack()[1].filename)
     if model_size not in MODEL_SIZES:
         raise ValueError(f"model_size={model_size!r} is not one of {MODEL_SIZES}.")
     base_checkpoint_path = _abs(base_checkpoint_path or BASE_CHECKPOINT_PATHS[model_size])
     vae_path = _abs(vae_path or "checkpoints/wan2pt2/Wan2.2_VAE.pth")
 
-    anomaly_types = [list(p) for p in anomaly_types]
-    num_classes = len(anomaly_types)
-    image_size_list: List[int] = list(image_size)
+    anomaly_types = [list(p) for p in sorted({(str(t), str(d)) for t, d in anomaly_types})]
+    anomaly_num_classes = len(anomaly_types)
 
-    # Parallelism is env-switchable: ANOMALYGEN_PARALLELISM=ddp (default, each rank holds the full,
-    # DDP-replicated model) or =fsdp (shard params/optimizer across all launched GPUs). This single
-    # value drives three things that must agree: the model group node, trainer.distributed_parallelism,
-    # and the model's own ``_dec.parallelism`` (read by set_up_parallelism to skip fully_shard under DDP).
+    # The crop geometry is checked once, here, so a bad recipe fails at parse rather than inside a
+    # DataLoader worker; the dataset and the crop stages trust the normalised values.
+    geometry = validate_geometry(crop_mode, input_size_ladder, crop_ratio_range, scale_range, inference_scale)
+    input_size_ladder = list(geometry.input_size_ladder)
+    crop_ratio_range, scale_range = geometry.crop_ratio_range, geometry.scale_range
+    if int(text_prompt_num_tokens) > CAPTION_TOKEN_BUDGET:
+        raise ValueError(f"text_prompt_num_tokens must be <= {CAPTION_TOKEN_BUDGET}, got {text_prompt_num_tokens}.")
+    if crop_mode == "ratio":
+        log.info(
+            "crop_mode='ratio': crop_ratio_range is the only framing axis; scale_range and inference_scale are unused."
+        )
+    # Headroom check: PackingDataLoader DISCARDS a sample at ``>=`` the budget, so the largest size
+    # must fit strictly. Token count mirrors _compute_num_tokens_per_sample: per vision item
+    # (h/32)*(w/32) + 2 delimiters, x2 items, plus the caption + 1 EOS.
+    if max_sequence_length is not None:
+        # Mirrors the dataset: padded to an exact length with the learnable prompt on, else
+        # free-length capped at CAPTION_TOKEN_BUDGET.
+        caption_tokens = text_prompt_num_tokens if learnable_text_prompt_enabled else CAPTION_TOKEN_BUDGET
+        top_size_tokens = sample_token_count(input_size_ladder[-1], input_size_ladder[-1], caption_tokens)
+        if top_size_tokens >= max_sequence_length:
+            raise ValueError(
+                f"input_size_ladder largest size {input_size_ladder[-1]} needs {top_size_tokens} tokens/sample "
+                f"(2 vision items + {caption_tokens} caption) but max_sequence_length is "
+                f"{max_sequence_length}; the packer discards samples at >= the budget."
+            )
+
+    # ANOMALYGEN_PARALLELISM=ddp (default; each rank holds the full, DDP-replicated model) or =fsdp
+    # (shard params/optimizer across all launched GPUs). One value drives three things that must
+    # agree: the model group node, trainer.distributed_parallelism, and ``_dec.parallelism``.
     parallelism = os.environ.get("ANOMALYGEN_PARALLELISM", "ddp").strip().lower()
     if parallelism not in ("ddp", "fsdp"):
         raise ValueError(f"ANOMALYGEN_PARALLELISM must be 'ddp' or 'fsdp', got {parallelism!r}")
     model_group = "anomalygen_texture_ft_mot_fsdp" if parallelism == "fsdp" else "anomalygen_texture_ft_mot_ddp"
 
     model_config = build_anomalygen_texture_ft_model_config(
-        num_classes,
+        anomaly_num_classes,
         vae_path,
-        anomaly_types=anomaly_types,
         model_size=model_size,
+        anomaly_types=anomaly_types,
         lora_enabled=lora_enabled,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
-        vision_prompt_item_enabled=vision_prompt_item_enabled,
-        vision_prompt_num_tokens=vision_prompt_num_tokens,
-        vision_prompt_freeze=vision_prompt_freeze,
         per_class_lora_enabled=per_class_lora_enabled,
         per_class_lora_rank=per_class_lora_rank,
         per_class_lora_alpha=per_class_lora_alpha,
-        inpaint_class_hidden_embed_enabled=inpaint_class_hidden_embed_enabled,
         learnable_text_prompt_enabled=learnable_text_prompt_enabled,
         text_prompt_num_tokens=text_prompt_num_tokens,
         text_prompt_init_word=text_prompt_init_word,
-        text_prompt_freeze=text_prompt_freeze,
-        model_input_size=model_input_size,
+        inpaint_loss_background_weight=inpaint_loss_background_weight,
         shift=shift,
+        crop_mode=crop_mode,
+        input_size_ladder=input_size_ladder,
+        crop_ratio_range=crop_ratio_range,
+        inference_scale=inference_scale,
+        activation_checkpointing_mode=activation_checkpointing_mode,
         parallelism=parallelism,
     )
+
+    # Token-budget packing gives each rank a data-dependent sample count per step, so the framework's
+    # default rank-level gradient average would weight a lone large-input sample as heavily as a peer
+    # rank's whole packed batch. Average per sample instead.
+    if max_sequence_length is not None:
+        model_config["rectified_flow_training_config"]["sample_level_loss_averaging"] = True
 
     return LazyDict(
         dict(
@@ -332,18 +394,15 @@ def build_anomalygen_texture_ft_experiment(
                 betas=list(betas),
                 eps=eps,
                 fused=True,
-                # Train only the LoRA adapters, the per-defect-type embedding, and the text prompt.
+                # Train only the LoRA adapters and the learnable text prompt.
                 keys_to_select=list(TRAINED_KEY_PREFIXES),
-                # Per-key LR multipliers (name-substring -> factor on base LR). Empty by default
-                # => all trained params share the base LR.
                 lr_multipliers=dict(lr_multipliers or {}),
                 lr=lr,
                 optimizer_type="AdamW",
                 weight_decay=weight_decay,
             ),
             scheduler=dict(
-                # Single-cycle warmup -> cosine decay: the scheduler takes parallel per-cycle lists,
-                # so the scalar knobs are wrapped in one-element lists here.
+                # The scheduler takes parallel per-cycle lists; one cycle => one-element lists.
                 lr_scheduler_type="LambdaCosine",
                 cycle_lengths=[cycle_lengths],
                 f_max=[1.0],
@@ -361,18 +420,22 @@ def build_anomalygen_texture_ft_experiment(
                 run_validation_on_start=run_validation_on_start,
                 seed=seed,
                 grad_scaler_args=dict(enabled=False),
-                # Hand this recipe's own values to the callbacks registered (arg-free) by
+                # torch.compile recompiles per distinct PACKED SEQUENCE LENGTH, so the ceiling counts
+                # combinations of input sizes per step, not input sizes. Must be set HERE: the trainer
+                # calls set_torch_compile_options at init and overwrites any torch._dynamo.config set
+                # outside. Training-only; generation keeps torch's defaults.
+                compile_config=dict(recompile_limit=COMPILE_RECOMPILE_LIMIT, use_duck_shape=False),
+                # Hand this recipe's values to the callbacks registered (arg-free) by
                 # anomalygen.register; merges onto the `anomalygen_texture_ft` callbacks group.
                 callbacks=dict(
-                    # Override the optimization group's default clip_norm (1.0) → tighter 0.1.
+                    # Tighter than the optimization group's default clip_norm of 1.0.
                     grad_clip=dict(clip_norm=0.1),
-                    # ValidationKPI writes valid_kpi.csv each validation_iter (nn/mnn/fid always;
-                    # axes + aq_nn when compute_anomaly_quality=True — these need SAM2).
+                    # Writes valid_kpi.csv each validation_iter: nn/mnn/fid always, axes + aq_nn
+                    # (SAM2) when compute_anomaly_quality is on.
                     validation_kpi=dict(compute_anomaly_quality=compute_anomaly_quality),
-                    # Early stopping on the monitored validation metric (the EarlyStop callback reads
-                    # the valid_kpi.csv ValidationKPI writes each validation_iter). metric ∈ {nn, mnn,
-                    # fid, aq_nn, completeness, precision, boundary_iou}; stops when it fails to improve for `patience` consecutive
-                    # validations. Disabled by default; set enabled=True to use it.
+                    # Reads that valid_kpi.csv and stops when `metric` fails to improve for `patience`
+                    # consecutive validations. metric ∈ {nn, mnn, fid, aq_nn, completeness,
+                    # precision, boundary_iou}.
                     early_stop=dict(
                         enabled=early_stop_enabled,
                         metric=early_stop_metric,
@@ -382,16 +445,15 @@ def build_anomalygen_texture_ft_experiment(
                         min_delta_mode=early_stop_min_delta_mode,
                         cumulative_delta=False,
                     ),
-                    # best_metric mirrors early_stop_metric so best_checkpoint.txt is selected on the
-                    # same metric the run was monitored on (see the EarlyStop block above); it is
-                    # honored whether or not early stopping is enabled.
+                    # best_checkpoint.txt is selected on the same metric the run is monitored on,
+                    # whether or not early stopping is enabled.
                     training_report=dict(recipe_path=recipe_path, best_metric=early_stop_metric),
                 ),
             ),
             checkpoint=dict(
                 dcp_async_mode_enabled=False,  # required for the save-keys filter (sync save path)
-                # The trained subset (+ EMA) is absent from the base DCP checkpoint → skip loading
-                # it (trained from scratch / template-initialized).
+                # The trained subset (+ EMA) is absent from the base DCP checkpoint — it is trained
+                # from scratch / template-initialized, so skip loading it.
                 keys_to_skip_loading=list(WARM_START_SKIP_PREFIXES),
                 load_path=base_checkpoint_path,
                 save_iter=save_iter,
@@ -400,44 +462,42 @@ def build_anomalygen_texture_ft_experiment(
             ),
             dataloader_train=L(PackingDataLoader)(
                 dataset_name="anomaly",
-                patch_spatial=2,
-                tokenizer_spatial_compression_factor=16,
+                patch_spatial=PATCH_SPATIAL,
+                tokenizer_spatial_compression_factor=VAE_SPATIAL_COMPRESSION,
                 tokenizer_temporal_compression_factor=4,
-                # Batch by sample count, not token budget. The nano recipe packs to
-                # max_sequence_length=45056 because video samples are huge; our 512x512 image
-                # samples are ~560 tokens each, so a token budget would cram ~80 samples into
-                # every step and the packing loop would dominate wall-clock. Pack 2 samples per
-                # step instead (mirrors the reference anomaly recipe's batch_size=2). Exactly one
-                # of max_sequence_length / max_samples_per_batch must be set.
-                max_sequence_length=None,
-                max_samples_per_batch=batch_size,  # THE training batch size: samples packed per step.
+                # Exactly one of the two must be non-None (framework assert). Under a token budget
+                # there is no sample ceiling, so samples/step varies with the input sizes drawn.
+                max_sequence_length=max_sequence_length,
+                max_samples_per_batch=None if max_sequence_length is not None else batch_size,
                 dataloader=L(RankPartitionedDataLoader)(
-                    # Inner per-pull size. Kept equal to max_samples_per_batch only to avoid the
-                    # misleading look of "batch_size=1"; it does NOT multiply the batch — the packed
-                    # batch is capped at max_samples_per_batch regardless of this value.
+                    # Inner per-pull size only; the packer above caps the actual training batch.
                     batch_size=batch_size,
                     num_workers=num_workers,
                     persistent_workers=True,
                     pin_memory=True,
                     prefetch_factor=4,
+                    # Overrides the framework's custom_collate_fn (only set via setdefault). Required
+                    # for variable resolution: edit_mask is not one of the framework's list-collated
+                    # keys, so it would be stacked and raise on any mixed-size batch.
+                    collate_fn=anomalygen_collate_fn,
                     datasets=dict(
                         image=dict(
                             ratio=1,
                             dataset=L(get_inpainting_dataset)(
                                 dataset_dir=dataset_path,
                                 anomaly_types=anomaly_types,
-                                image_size=image_size_list,
-                                ratio_range=list(ratio_range),
-                                # Same seed as trainer.seed: drives the per-worker augmentation rng so
-                                # the augmentation stream is reproducible from the experiment seed.
+                                crop_mode=crop_mode,
+                                crop_ratio_range=list(crop_ratio_range),
+                                scale_range=list(scale_range),
+                                input_size_ladder=list(input_size_ladder),
+                                # Drives the per-worker augmentation rng, so the augmentation stream
+                                # is reproducible from the experiment seed.
                                 seed=seed,
                                 # Cycle the (few-shot) sample set to a large virtual length so the
                                 # PackingDataLoader's one-shot iterator never exhausts mid-run (it
                                 # busy-spins on StopIteration otherwise). 100000x covers any max_iter.
                                 repeat=100000,
-                                # Per-sample prob the source item's background is dropped to -1 (black).
                                 background_dropout_prob=background_dropout_prob,
-                                # Per-sample probs for the two read-time defect augmentations.
                                 inst_aug_prob=inst_aug_prob,
                                 ring_jitter_prob=ring_jitter_prob,
                                 # Pad every caption to the learnable-prompt length so each sample
@@ -450,17 +510,20 @@ def build_anomalygen_texture_ft_experiment(
                     ),
                 ),
             ),
-            # Real sharded validation loader: each rank generates a disjoint, (guidance,shift)-
-            # homogeneous shard in model.validation_step; ValidationKPI.on_validation_end gathers +
-            # scores.
+            # Real sharded validation loader: each rank generates a disjoint, (guidance, num_steps)-homogeneous
+            # shard in model.validation_step; ValidationKPI.on_validation_end gathers + scores.
             dataloader_val=L(get_inpaint_val_dataloader)(
                 input_data_path=testcase_jsonl,
                 val_batch_size=validation_batch_size,
-                shift=shift,
                 num_workers=num_workers,
-                # Training instantiates dataloaders under a chdir to the framework checkout, so
-                # repo-root-relative testcase image/mask paths must resolve against the repo root.
+                # Dataloaders are instantiated under a chdir to the framework checkout, so
+                # repo-root-relative testcase image/mask paths need an explicit root.
                 base_dir=str(_REPO_ROOT),
+                # Bound one validation forward by the training token budget: batches are cut by count,
+                # and a batch of large defects planned at the top of the ladder would otherwise pack
+                # many times the tokens of a training step.
+                token_budget=max_sequence_length,
+                diffusion_expert_config="${model.config.diffusion_expert_config}",
             ),
         ),
         flags={"allow_objects": True},

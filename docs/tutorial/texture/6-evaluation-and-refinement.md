@@ -5,14 +5,15 @@ SPDX-License-Identifier: Apache-2.0
 
 # 6 · Evaluation, Refinement & Pseudo-labeling
 
-This is the last page of the PAIDF AnomalyGen texture tutorial series:
+This is the sixth page of the CDF AnomalyGen texture tutorial series:
 
 1. [Overview & Setup](1-overview.md)
 2. [Dataset Preparation](2-dataset-preparation.md)
-3. [Auto Mask Placement](3-auto-mask-placement.md)
+3. [Agentic Mask Generation](3-agentic-mask-generation.md) (or classic [Auto Mask Placement](3-auto-mask-placement.md))
 4. [Fine-tuning](4-fine-tuning.md)
 5. [Generation](5-generation.md)
 6. **Evaluation, Refinement & Pseudo-labeling** ←
+7. [Agentic End-to-End Flow](7-agentic-end-to-end-flow.md)
 
 It assumes you finished [`5-generation.md`](5-generation.md) and have a generation output tree at
 `results/generation_phone_screen/`.
@@ -96,14 +97,13 @@ Each per-type block also carries a `per_sample` array — one entry per generate
 `nn_score`, `mnn_score` and the per-sample axis scores (elided above); the `Average` block does not.
 
 > **Judge scores against your own runs, not against a fixed target.** `nn_score` / `mnn_score` are
-> relative measures whose absolute scale depends on the dataset *and* on the scoring config —
-> which changed.
+> relative measures whose absolute scale depends on the dataset *and* on the scoring config.
 
 **Reading the KPI:**
 
-- **`nn_score` / `mnn_score`** — nearest-neighbor and mutual-nearest-neighbor correspondence distances
-  between each generated defect and its closest real references. These measure how close the synthetic
-  anomalies land to the real ones.
+- **`nn_score` / `mnn_score`** — nearest-neighbor and mutual-nearest-neighbor cosine similarities
+  (DINOv2 features) between each generated defect and its closest real references: **higher is
+  better**. These measure how close the synthetic anomalies land to the real ones.
 - **`fid`** — an optional set-level Fréchet distance over the defect crops. It needs at least 2 crops
   per type.
 - **`completeness` / `precision` / `boundary_iou`** — the anomaly-quality axes: how much of the mask
@@ -128,7 +128,7 @@ The `run` subcommand drives the whole thing: `(draw → generate → evaluate) �
   Gaussian process over that one sample's own `(guidance, crop_ratio) -> score` history,
   Thompson-sampled. Draws are seeded — under `run`, each round is seeded with its own round number —
   so a round is reproducible.
-- **`select`** picks each sample's best-scoring render across the original bucket and every round,
+- **`select`** picks each sample's best-scoring render across the original bucket and the requested rounds,
   into a `searched/` bucket.
 
 ```shell
@@ -142,36 +142,88 @@ python anomalygen/scripts/texture/quality_refine.py run \
     --checkpoint results/anomalygen/phone_screen/anomalygen_texture_ft/checkpoints/model/iter_000015000.pt \
     --recipe results/anomalygen/phone_screen/anomalygen_texture_ft/exp_texture_ft_phone_screen.yaml \
     --real_root datasets/phone_screen \
+    --score nn \
     --num_search_run 3 --num_gpus 1
 ```
 
-- **`--base_testcase`** — the AMP generation testcase file that produced `--original` (the mask
-  placements the search holds fixed).
+- **`--base_testcase`** — the generation `testcase.jsonl` from page 3 (AMG or AMP) that produced
+  `--original` (the mask placements the search holds fixed).
 - **`--original` / `--original_kpi`** — the [generation](5-generation.md) output tree and its
   [evaluation](#evaluate) KPI JSON: round 0 of the search, and the baseline every round is measured
   against.
 - **`--num_search_run`** (default `3`) — how many `draw → generate → evaluate` rounds to run. Each
-  round costs one full generation pass over the batch, so this is the main cost dial.
-- **`--score`** (default `nn`) — the per-sample metric the search optimizes and selects on: `nn`,
-  `mnn`, `completeness`, `precision`, `boundary_iou`, or `aq_nn`. `aq_rank` is deliberately **not**
-  offered here — it is a rank-relative composite whose value for one sample moves when its neighbours
-  change, so it is not a fixed target a per-sample optimizer can climb.
-- **`--guidance_range`** (default `1.5 10.0`) and **`--crop_ratio_range`** (default `1.5 8.0`) — the
-  box the search draws from.
+  round costs one full generation pass over the batch, so this is the main cost dial (measured
+  refinement times for the example datasets:
+  [`7-agentic-end-to-end-flow.md`](7-agentic-end-to-end-flow.md#end-to-end-timing)).
+- **`--score`** (default `nn`) — the metric the search optimizes and selects on: `nn`, `mnn`,
+  `completeness`, `precision`, `boundary_iou`, `aq_nn`, or `aq_rank`. `aq_rank` is the optional
+  cumulative composite of NN and the three geometry axes described below. The geometry-based scores
+  need the SAM2 checkpoint; without it `evaluate.py` falls back to NN/MNN with a warning and `run`
+  stops before round 1 for lack of a usable score.
+- **`--guidance_range`** (default `1.0 10.0`) and **`--crop_ratio_range`** — the box the search draws
+  from. `--crop_ratio_range` defaults to the band `--recipe` trained under (falling back to
+  `1.5 2.5`), because generation clamps a testcase's `crop_ratio` into that band; drawing wider just
+  repeats its edge. An explicit range is therefore narrowed to that band (with a warning), and one
+  entirely outside it is refused. Its `LOW` must be at least `1.5`, the floor a recipe's band has.
 - **`--num_gpus`** — GPUs for each round's generation pass.
 - **`--output_root`** (default `results`) — `IMAGINAIRE_OUTPUT_ROOT` for each round's `generate.py`.
   It is passed explicitly because the framework otherwise falls back to `/tmp/imaginaire4-output`
   without complaining.
 - **`--dry_run`** prints each stage's command without running it.
 
-> **⚠ Generate `--original` with the default `--base_seed`.** Rounds always run at `--base_seed 1`
-> (`run` has no flag to change it). An original generated with a different seed carries different
-> noise, so rounds win or lose on noise as well as on params.
+> **⚠ Rounds must differ from the original only in `(guidance, crop_ratio)`.** Each round runs
+> `generate.py` with its defaults (`--base_seed 1`, guardrail on); if you generated `--original` with
+> another seed, `--no-guardrail` or a `--base_checkpoint`, pass the same to `run`, which forwards
+> them to every round. Otherwise rounds win or lose on noise as well as on params.
 
 `run` **gates each round** — one image per testcase row *and* its `kpi.json` — and exits non-zero
 rather than assembling a stale `searched/` from an unfinished round. The scoring knobs it is given
 are forwarded to every round's `evaluate`, so each round is scored exactly the way the batch it is
-selected against was.
+selected against was. `run` has no resume, so repair a failed round in place rather than re-running
+`run` (which would redraw every round from 1); see the
+[quality-refinement reference](../../../skills/anomalygen/references/quality-refinement.md).
+
+It also requires the generation CSV to name exactly the reconstructed images in that round. This
+check applies to every score mode because both BO history and final selection join KPI rows through
+that CSV. `run` passes the current round explicitly so resumed or manually retained later-round
+directories cannot leak into the active round's history. When invoking `draw` directly with a
+non-standard output path and an existing `--rounds_dir`, pass `--current_round <r>`.
+When invoking `select` directly, pass `--max_round <N>` to exclude stale later rounds; without it,
+standalone selection intentionally considers every canonical positive-numbered round.
+
+### NN versus cumulative AQ-Rank
+
+With the default `--score nn`, every observation is the sample's absolute NN value. With
+`--score aq_rank`, the search does **not** trust the `aq_rank_score` already stored inside each
+individual bucket: that value was ranked against that bucket alone. Before each draw it instead:
+
+1. pools Original with all earlier rounds;
+2. groups the candidates by anomaly type;
+3. recomputes AQ-Rank from NN, completeness, precision, and boundary IoU; and
+4. uses those current pooled ranks as the per-sample Bayesian-optimization history.
+
+Final selection recomputes the same ranking over Original plus the rounds generated by the current
+run. This mode ranks only candidates with finite values for all four raw inputs. An invalid candidate
+is logged and excluded, so it cannot be rewarded when an axis is oriented negatively, while the rest
+of the bucket remains usable. A bucket with no eligible candidate or a CSV/KPI mismatch stops the
+run. If one sample has no eligible render in any otherwise-valid bucket, selection logs the fallback
+and keeps its Original render without treating it as an AQ-Rank win. A per-type pool below five
+eligible candidates is explicitly logged and ranks that type by NN only.
+
+AQ-Rank learns each geometry axis's sign from differences **across the pooled samples**, then uses
+that sign to choose among Original and round variants **within one sample**. The two relationships can
+point in opposite directions, so this compass is an auditable heuristic rather than a guarantee of
+within-sample improvement. Each re-ranking logs the pool size plus completeness, precision, and
+boundary-IoU AUROC and sign (`+1`, `-1`, or `disabled`). Keep these logs when interpreting a run; a
+within-sample orientation would be a new algorithm requiring separate validation.
+The current `|AUROC - 0.5| >= 0.05` gate is permissive: it rejects constant or nearly signalless axes,
+but it is not a significance test or proof that an enabled sign improves within-sample choices.
+
+NN remains the conservative default. Use AQ-Rank when you explicitly want correspondence and mask
+geometry to participate in the search. In a seven-dataset pilot the two objectives selected later
+rounds at similar rates, and a one-reviewer blind comparison detected no statistically significant
+perceptual difference between their final outputs. Treat both as usable search objectives, not as
+proven perceptual equivalents.
 
 ### Output
 
@@ -186,7 +238,7 @@ results/generation_phone_screen/
     ├── original_image/
     ├── original_mask/
     ├── annotated_image/
-    ├── texture_ft_generation_result.csv   # winning params + nn_score, mnn_score, selected_by, source
+    ├── texture_ft_generation_result.csv   # winning params + metrics + selected_by + source
     ├── search_summary.csv                 # per sample: source, score, original_score, improved
     ├── per_sample.csv                     # per-sample nn + mnn table
     └── kpi.json                           # --final_kpi: the refined batch's KPI
@@ -195,11 +247,13 @@ results/generation_phone_screen/
 **`select` always runs**, so `searched/` always exists for pseudo-labeling — with
 `--num_search_run 0` it simply clones `--original`.
 
-**Reading the result:** the `Average.nn_score` delta between `searched/kpi.json` and the Step 5
-`generation_phone_screen_kpi.json` is what refinement bought. Because selection is per sample, expect
-the refined batch to beat *every* individual round. A `source` column that is all `original` means no
-round beat the baseline for any sample — a valid outcome, not a failure; a delta near zero means the
-search added nothing, so raise `--num_search_run` or widen `--guidance_range`.
+**Reading the result:** under `--score nn`, compare the `Average.nn_score` in `searched/kpi.json` with
+the `generation_phone_screen_kpi.json` from [Evaluate](#evaluate). A `source` column that is all
+`original` means no round beat the baseline for any sample — a valid outcome, not a failure.
+
+Under `--score aq_rank`, do not compare AQ-Rank means from separate KPI files: ranks are relative to
+the pool in which they were computed. Read `source` and `search_summary.csv`, compare paired raw
+metrics, and use human review or downstream performance to judge whether the trade-off is useful.
 
 ## Filtering (optional)
 
@@ -225,9 +279,9 @@ python anomalygen/scripts/texture/filter.py \
     `completeness + nn_score` composite.
   - `aq_rank` — `nn` and each geometry axis rank-normalised **within the anomaly type**, each axis
     signed `+`/`−` by whether it agrees with `nn`'s own strongest/weakest samples, then summed:
-    `aq_rank = rank(nn) + Σ ±rank(axis)`. Best *mean* ranking across our internal datasets, but it
-    signs itself from `nn`, so where `nn` is weak it can mis-sign an axis and score below plain `nn`
-    — **opt-in**, not the default.
+    `aq_rank = rank(nn) + Σ ±rank(axis)`. It jointly considers correspondence and geometry, but signs
+    itself from `nn`, so a weak NN anchor can orient an axis incorrectly. It is therefore an
+    **opt-in** alternative rather than a human-quality guarantee.
   - The geometry axes run SAM2, so any score using them needs `--real_root` and `original_image/`.
 - **`--drop_ratio`** — fraction in `[0, 1]` to drop per type; `0.3` keeps the top 70%. Samples that
   could not be scored are dropped first.
@@ -277,7 +331,7 @@ The three stages do different jobs with the same score, and only the first is ma
   ones, on average and per type?" — and produces the KPI the other two are judged against.
 - **Refinement *improves*.** It makes weak samples better by re-generating them with searched params,
   so nothing is discarded. Cost is `--num_search_run` extra generation passes, and the payoff is the
-  `Average.nn_score` delta between `searched/kpi.json` and the Step 5 KPI. Skip it if a full extra
+  `Average.nn_score` delta between `searched/kpi.json` and the Evaluate KPI. Skip it if a full extra
   pass over the batch is too expensive, or if that delta comes back near zero on your data.
 - **Filtering *discards*.** It turns the same score into a curated set — the `keep/` tree holds the
   highest-scoring synthetic anomalies (image + mask + original), ready to drop into a downstream
@@ -374,15 +428,7 @@ results/generation_phone_screen/filtered/pseudo_labels/
   — captioner generation knobs; the temperature defaults to `0`, which decodes greedily. Pass
   `>0` to sample at that temperature instead.
 
-## Recap — the full pipeline
+## Next step
 
-You now have the complete texture AnomalyGen workflow:
-
-| Step | Page                                            | What you produced                                                                                               |
-| ---- | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| 1    | [Overview & Environment Setup](1-overview.md)   | working env + checkpoints + a passing preflight                                                                 |
-| 2    | [Dataset Preparation](2-dataset-preparation.md) | a dataset dir with `anomaly_image/`, `mask/`, `clean_image/`                                                    |
-| 3    | [Auto Mask Placement](3-auto-mask-placement.md) | validation + generation `testcase.jsonl` with placed masks                                                      |
-| 4    | [Fine-tuning](4-fine-tuning.md)                 | a fine-tuned run under `results/anomalygen/…`                                                                   |
-| 5    | [Generation](5-generation.md)                   | a batch of synthetic anomalies at `results/generation_phone_screen/`                                            |
-| 6    | Evaluation, Refinement & Pseudo-labeling ←      | `generation_phone_screen_kpi.json`, a refined `searched/` bucket, an optional `keep/` set, and `pseudo_labels/` |
+Continue to [7 · Agentic End-to-End Flow](7-agentic-end-to-end-flow.md), which runs all of the above
+from a single agent prompt.

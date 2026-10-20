@@ -18,7 +18,8 @@ Two exclusions, both by definition rather than convenience:
     obligations for that code apply to the container regardless of who packaged it. Both are
     attributed here — see ``FIRST_PARTY_WITH_THIRD_PARTY_CONTENT``, which also records which
     first-party packages were audited and found to carry no such material.
-  * This repo's own packages (paidf-anomalygen, the lerobot stub).
+  * This repo's own packages (cdf-anomalygen and the lerobot, pycountry and nltk stubs), and
+    anything installed from this checkout under another name — see ``installed_from_this_repo``.
 
 Pass ``--include-nvidia`` to emit the unfiltered closure instead.
 
@@ -36,7 +37,7 @@ accumulates packages the image never has.
 `develop`, not `product`, is what this project releases, so its ``requirements-dev.txt`` tooling is
 in scope deliberately. That file is pinned to keep this artefact reproducible:
 
-    docker run --rm -v "$PWD:/workspace/paidf-anomalygen" -w /workspace/paidf-anomalygen \
+    docker run --rm -v "$PWD:/workspace/cdf-anomalygen" -w /workspace/cdf-anomalygen \
         "$IMAGE" /opt/venv/bin/python scripts/generate_third_party_licenses.py
 
 Write the output into the bind-mounted repo; a container-local path is lost on exit. Re-run after
@@ -46,11 +47,15 @@ changing dependencies, then diff the result before committing it.
 from __future__ import annotations
 
 import argparse
+import json
 import re
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
+
+_APACHE_2_0 = "Apache-2.0"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SEPARATOR = "-" * 80
@@ -72,9 +77,19 @@ UPSTREAM_LICENSE_URLS: dict[str, tuple[str, ...]] = {
         "https://raw.githubusercontent.com/facebookresearch/fvcore/c74b80272065b4629f7c6b8fb67d09608859b8f1/LICENSE",
     ),
     "loguru": ("https://raw.githubusercontent.com/Delgan/loguru/0.7.3/LICENSE",),
-    "megatron-core": ("https://raw.githubusercontent.com/NVIDIA/Megatron-LM/core_v0.18.2/LICENSE",),
-    "multi-storage-client": ("https://raw.githubusercontent.com/NVIDIA/multi-storage-client/1.0.1/LICENSE",),
-    "obstore": ("https://raw.githubusercontent.com/developmentseed/obstore/py-v0.11.0/LICENSE",),
+    # 0.19.1 has no tag; this is the core_r0.19.0 release-branch commit whose package_info says 0.19.1.
+    "megatron-core": (
+        "https://raw.githubusercontent.com/NVIDIA/Megatron-LM/8e2a184627bbbb09107acefe2df25b0c98dd8757/LICENSE",
+    ),
+    "mistral-common": ("https://raw.githubusercontent.com/mistralai/mistral-common/v1.11.7/LICENCE",),
+    "model-hosting-container-standards": (
+        "https://raw.githubusercontent.com/aws/model-hosting-container-standards/v0.1.16/LICENSE",
+    ),
+    "multi-storage-client": ("https://raw.githubusercontent.com/NVIDIA/multi-storage-client/1.1.0/LICENSE",),
+    "obstore": ("https://raw.githubusercontent.com/developmentseed/obstore/py-v0.11.1/LICENSE",),
+    "opentelemetry-semantic-conventions-ai": (
+        "https://raw.githubusercontent.com/traceloop/openllmetry/ddcff1c205bf041f262a823a08ac8915cc8d156b/LICENSE",
+    ),
     "pycocotools": (
         "https://raw.githubusercontent.com/ppwwyyxx/cocoapi/2971b0430e0990f119c60c8708ca66d4a5fed5d0/license.txt",
     ),
@@ -84,6 +99,7 @@ UPSTREAM_LICENSE_URLS: dict[str, tuple[str, ...]] = {
     "sentencepiece": ("https://raw.githubusercontent.com/google/sentencepiece/v0.2.2/LICENSE",),
     "tokenizers": ("https://raw.githubusercontent.com/huggingface/tokenizers/v0.22.2/LICENSE",),
     "transformer-engine-torch": ("https://raw.githubusercontent.com/NVIDIA/TransformerEngine/v2.15/LICENSE",),
+    "z3-solver": ("https://raw.githubusercontent.com/Z3Prover/z3/z3-4.15.4/LICENSE.txt",),
 }
 
 # Distributions that publish no license text anywhere — not in the wheel, not in a public repo.
@@ -126,11 +142,11 @@ LICENSE_LABEL_OVERRIDES: dict[str, str] = {
     "better-profanity": "MIT",
     "natten": "MIT",
     # Full Apache 2.0 text, including the TERMS AND CONDITIONS preamble.
-    "sentencepiece": "Apache-2.0",
-    "transformer-engine": "Apache-2.0",
-    "transformer-engine-cu13": "Apache-2.0",
-    "transformer-engine-torch": "Apache-2.0",
-    "yacs": "Apache-2.0",
+    "sentencepiece": _APACHE_2_0,
+    "transformer-engine": _APACHE_2_0,
+    "transformer-engine-cu13": _APACHE_2_0,
+    "transformer-engine-torch": _APACHE_2_0,
+    "yacs": _APACHE_2_0,
     # No text to read; NO_UPSTREAM_TEXT explains the provenance for these.
     "cuda-toolkit": "NVIDIA CUDA Toolkit EULA",
 }
@@ -176,11 +192,9 @@ PAYLOAD_LICENSE_FILES: dict[str, tuple[str, ...]] = {
 # absent from a container that ships it, and because the redaction runs before the copyleft gates
 # read package.texts, it would also erase the declaration those gates key on. So the path is part
 # of the rule and redact_notice() refuses to strip a stanza whose file is still present.
-NOTICE_REDACTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
-    # Deleted from site-packages during the image build; see docker/Dockerfile, immediately after
-    # the cosmos-framework install.
-    "cosmos-framework": (("TaylorSeer", "cosmos_framework/model/generator/utils/taylorseer.py", ""),),
-}
+#
+# Empty means no build step deletes attributed code today.
+NOTICE_REDACTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {}
 
 # NVIDIA first-party distributions. Excluded from the *third-party* notice file — they are ours,
 # not a third party's. Matched as exact names or `prefix-*` / `prefix_*` families.
@@ -293,7 +307,7 @@ ACCEPTED_VENDORED_COPYLEFT: dict[str, tuple[frozenset[str], str]] = {
 ACCEPTED_WEAK_COPYLEFT = frozenset({"certifi", "tqdm"})
 
 # This repo's own packages — never a dependency of anything, never attributed.
-LOCAL_PACKAGES = frozenset({"paidf-anomalygen", "lerobot-stub"})
+LOCAL_PACKAGES = frozenset({"cdf-anomalygen", "lerobot-stub", "pycountry-stub", "nltk-stub"})
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +378,29 @@ def installed_distributions() -> dict[str, metadata.Distribution]:
         if name:
             found.setdefault(normalize(name), dist)
     return found
+
+
+def installed_from_this_repo(dist: metadata.Distribution) -> bool:
+    """True for an install of this checkout, whatever project name it was installed under.
+
+    ``LOCAL_PACKAGES`` matches by name, which misses a checkout installed before a rename: its old
+    metadata is still importable and would be attributed as an unknown third party. Two traces
+    identify such an install without naming it:
+      * its metadata directory sits directly in the repo root (the ``*.egg-info`` an editable
+        build leaves there) — not anywhere under it, since a local ``.venv`` lives there too;
+      * its ``direct_url.json`` records an editable install of the repo root itself — not of a
+        directory under it, which could hold a vendored third-party project.
+    """
+    if Path(str(dist.locate_file(""))).resolve() == REPO_ROOT:
+        return True
+    direct_url = dist.read_text("direct_url.json")
+    if not direct_url:
+        return False
+    origin = json.loads(direct_url)
+    url = urllib.parse.urlparse(origin.get("url", ""))
+    if url.scheme != "file" or not origin.get("dir_info", {}).get("editable"):
+        return False
+    return Path(urllib.request.url2pathname(url.path)).resolve() == REPO_ROOT
 
 
 def bundled_texts(dist: metadata.Distribution) -> list[tuple[str, str]]:
@@ -576,7 +613,7 @@ def collect(include_nvidia: bool) -> tuple[list[Package], list[str]]:
     # Prefix matching is on name shape, not provenance — report what it drops so it stays auditable.
     by_prefix: list[str] = []
     for name, dist in installed_distributions().items():
-        if name in LOCAL_PACKAGES:
+        if name in LOCAL_PACKAGES or installed_from_this_repo(dist):
             continue
         if not include_nvidia and is_nvidia_first_party(name) and name not in FIRST_PARTY_WITH_THIRD_PARTY_CONTENT:
             if normalize(name) not in NVIDIA_FIRST_PARTY_NAMES:
@@ -608,7 +645,7 @@ def render(packages: list[Package], include_nvidia: bool) -> str:
         "This file contains the license texts for all dependencies used in this project.",
         "",
         f"Scope: {scope}, transitive dependencies included.",
-        "PAIDF AnomalyGen does not redistribute these packages — they are downloaded when you",
+        "CDF AnomalyGen does not redistribute these packages — they are downloaded when you",
         "build the environment.",
         "",
         f"Total packages: {len(packages)}",

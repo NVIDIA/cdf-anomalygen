@@ -119,7 +119,8 @@ Follow these steps to download the Roboflow COCO export zip manually:
 3. Navigate to <https://universe.roboflow.com/vu-thi-thu-huyen/mobile-screen>.
 4. Click **Fork Dataset** to create your own copy of the dataset in your own Projects / Workspace.
 5. In your own Projects / Workspace, enter the **Mobile screen** page and select **Dataset** on the left bar.
-6. Click **Export** on the top-right corner of the page.
+6. At the bottom of the page, tick the check box to the left of **0 selected**, then click
+   **Select all 320 media items in your library**. Click **Export** at the bottom-right.
 7. Choose **Analyze or experiment** and click **Continue**.
 8. Click **Download Anyway**.
 9. Select **COCO** format, click **Export As** and click **Zip file**.
@@ -135,7 +136,10 @@ python -m anomalygen.scripts.datasets.prepare_phone_screen_defect --output_dir .
 ```
 
 - Masks + `defect_spec.jsonl` are always fetched from HF; `--zip` also extracts the Roboflow images.
-- Flags: `--zip <path>` (optional; omit to fetch only masks + `defect_spec.jsonl`), `--dryrun` (preview without writing).
+- `--zip` is **required**. Without it the dataset has no clean or anomaly images, and nothing can be
+  generated from it — so the script refuses rather than writing one. `--masks_only` asks for exactly
+  that incomplete dataset on purpose (for inspecting the masks).
+- Flags: `--zip <path>` (required unless `--masks_only`), `--masks_only`, `--dryrun` (preview without writing).
 
 **Output:**
 

@@ -5,21 +5,23 @@ SPDX-License-Identifier: Apache-2.0
 
 # 2 · Dataset Preparation
 
-This is the second page of the PAIDF AnomalyGen texture tutorial series:
+This is the second page of the CDF AnomalyGen texture tutorial series:
 
 1. [Overview & Setup](1-overview.md)
 2. **Dataset Preparation** ←
-3. [Auto Mask Placement](3-auto-mask-placement.md)
+3. [Agentic Mask Generation](3-agentic-mask-generation.md) (or classic [Auto Mask Placement](3-auto-mask-placement.md))
 4. [Fine-tuning](4-fine-tuning.md)
 5. [Generation](5-generation.md)
 6. [Evaluation, Refinement & Pseudo-labeling](6-evaluation-and-refinement.md)
+7. [Agentic End-to-End Flow](7-agentic-end-to-end-flow.md)
 
 It assumes you have finished [`1-overview.md`](1-overview.md): the venv is built, Hugging Face
 auth is configured, and the base checkpoints are downloaded.
 
 By the end you will have a `dataset_dir` on disk laid out exactly the way the trainer expects. That
-directory is the input to [`3-auto-mask-placement.md`](3-auto-mask-placement.md), and what you later
-pass to a fine-tuning recipe as `dataset_path` ([`4-fine-tuning.md`](./4-fine-tuning.md)).
+directory is the input to page 3 ([Agentic Mask Generation](3-agentic-mask-generation.md), or classic
+[Auto Mask Placement](3-auto-mask-placement.md)), and what you later pass to a fine-tuning recipe as
+`dataset_path` ([`4-fine-tuning.md`](./4-fine-tuning.md)).
 
 All commands are run from the **repo root**.
 
@@ -62,8 +64,8 @@ python -m anomalygen.scripts.datasets.prepare_pcb_defect --output_dir datasets/p
 ```
 
 **Magnetic tile** — downloaded from public GitHub (no auth); the script curates the reference subset
-(5 anomaly images + masks per type, 20 clean images) and converts the JPEGs to PNG. The raw archive
-is cached under `datasets/magnetic_tile/.cache/`:
+(5 anomaly images + masks per type, 20 clean images) and converts the anomaly JPEGs to PNG; the
+clean images stay JPEG. The raw archive is cached under `datasets/magnetic_tile/.cache/`:
 
 ```shell
 python -m anomalygen.scripts.datasets.prepare_magnetic_tile_defect --output_dir datasets/magnetic_tile
@@ -80,14 +82,17 @@ Download the COCO export zip from
 2. Open <https://universe.roboflow.com/vu-thi-thu-huyen/mobile-screen>.
 3. Click **Fork Dataset** to copy it into your own Workspace.
 4. In your Workspace, open the **Mobile screen** project and select **Dataset** in the left bar.
-5. Click **Export** (top-right).
+5. At the bottom of the page, tick the check box to the left of **0 selected**, then click
+   **Select all 320 media items in your library**. Click **Export** at the bottom-right.
 6. Choose **Analyze or experiment**, then **Continue**.
 7. Click **Download Anyway**.
 8. Select **COCO** format, click **Export As**, and choose **Zip file**.
 9. When the export finishes, click **Download**.
 10. Save the resulting `Mobile screen.coco.zip` somewhere the script can read it.
 
-Pass that zip to `--zip`; omit it to fetch only the masks and spec:
+Pass that zip to `--zip`. It is required: without it the script would write a dataset with no
+images in it, so it refuses and points back here. `--masks_only` asks for that mask-only tree
+deliberately.
 
 ```shell
 python -m anomalygen.scripts.datasets.prepare_phone_screen_defect \
@@ -99,8 +104,11 @@ python -m anomalygen.scripts.datasets.prepare_phone_screen_defect \
 
 ### Verify the output tree
 
-Each script ends with a `Done: … N anomaly, N mask, N clean; N defect_spec entries` summary. All
-three produce the same shape — only the texture folder and defect names differ. For `phone_screen`:
+Each script ends with a `Done: … N anomaly, N mask, N clean; N defect_spec entries` summary.
+`phone_screen` and `magnetic_tile` produce the same shape — only the texture folder and defect names
+differ; `pcb` adds a second texture, a `cad_mask/` folder per texture and
+`semantic_segmentation_labels.json` at the root (see the contract below), and ships JPEG images and
+masks. For `phone_screen`:
 
 ```text
 datasets/phone_screen/
@@ -114,16 +122,16 @@ datasets/phone_screen/
 │   │   ├── scratch/   Scr_0001_mask.png  …
 │   │   └── stain/     Sta_0001_mask.png  …
 │   └── clean_image/   0001.png  0002.png  …    # defect-free screens (from Roboflow --zip)
-└── defect_spec.jsonl                       # one JSON line per defect type      (from Hugging Face)
+└── defect_spec.jsonl                       # one JSON line per defect type, AMP only (from Hugging Face)
 ```
 
 - **`anomaly_image/{defect}/` + `mask/{defect}/`** are the only inputs **training** reads. Each defect
   image is paired with the mask of the same stem plus a `_mask` suffix.
 - **`clean_image/`** holds the defect-free images that mask placement and generation paint onto.
-- **`defect_spec.jsonl`** describes each defect type (its ROI prompt / spatial dependency).
+- **`defect_spec.jsonl`** describes each defect type (its ROI prompt / spatial dependency). It is read
+  only by classic Auto Mask Placement; Agentic Mask Generation ignores it.
 
-That directory is now your `dataset_dir` — the input to
-[`3-auto-mask-placement.md`](3-auto-mask-placement.md), and the `dataset_path` you pass to a
+That directory is now your `dataset_dir` — the input to page 3, and the `dataset_path` you pass to a
 fine-tuning recipe ([`4-fine-tuning.md`](./4-fine-tuning.md)).
 
 ______________________________________________________________________
@@ -141,9 +149,9 @@ For a dataset rooted at `{dataset_dir}`, each `(texture, defect)` class needs th
 {dataset_dir}/{texture}/anomaly_image/{defect}/<name>.png   # the defect image
 {dataset_dir}/{texture}/mask/{defect}/<name>_mask.png       # binary mask for that image
 {dataset_dir}/{texture}/clean_image/<name>.png              # clean images (as generation inputs)
-{dataset_dir}/defect_spec.jsonl                             # one JSON object per defect type
+{dataset_dir}/defect_spec.jsonl                             # AMP only: one JSON object per defect type
 
-# only when a defect uses spatial_dependency: cad
+# AMP only, and only when a defect uses spatial_dependency: cad or cad_tht
 {dataset_dir}/{texture}/cad_mask/<clean_stem>.png           # CAD mask, one per clean_image/ file
 {dataset_dir}/semantic_segmentation_labels.json             # label map for those CAD masks
 ```
@@ -151,22 +159,31 @@ For a dataset rooted at `{dataset_dir}`, each `(texture, defect)` class needs th
 What to get right:
 
 - **Every defect image needs a matching mask.** For `anomaly_image/{defect}/<name>.png`, put its mask
-  at `mask/{defect}/<name>_mask.png` — the same filename plus a `_mask` suffix. Any image with no
-  matching mask is skipped. Images can be `.png`, `.jpg`, or `.jpeg`.
-- **In each mask, white marks the defect and black is the background.** A white blob on a black
-  background is the normal form.
+  at `mask/{defect}/<name>_mask.png` — the same stem plus a `_mask` suffix, with the image's own
+  extension or `.png` (PNG recommended; JPEG masks are lossy). Any image with no matching mask is
+  skipped. Images can be `.png`, `.jpg`, or `.jpeg`.
+- **Image and mask must be the same pixel size**, and a mask must not be empty: empty masks are
+  skipped, and a class whose masks are all empty (or that has no pairs) stops training.
+- **In each mask, white marks the defect and black is the background.** Pixels `>= 128` count as
+  defect.
 - **`clean_image/` is not used for training.** It holds the defect-free images that *generation*
   ([`5-generation.md`](5-generation.md)) paints anomalies onto. Only the `anomaly_image` + `mask` pairs
   are used to fine-tune.
 - **Folder names are the defect labels.** The `{texture}` and `{defect}` folder names must match the
   `anomaly_types: [[texture, defect], ...]` you list in the fine-tuning recipe, and the
-  `"{texture}+{defect}"` strings (e.g. `Phone+oil`) you use in `defect_spec.jsonl`.
+  `"{texture}+{defect}"` strings (e.g. `Phone+oil`) you use in `defect_spec.jsonl`. The names also
+  appear in the training caption, and a defect name the content-safety guardrail flags (e.g. `crack`)
+  blocks every generated image of that type unless generation runs with `--no-guardrail` (see
+  [5-generation.md](5-generation.md#the-content-safety-guardrail)).
 - **`cad_mask/` is keyed by the clean image, not the defect.** It is needed only for defects with
-  `spatial_dependency: cad`, and holds one mask per `clean_image/` file under the *same stem*.
+  `spatial_dependency: cad` or `cad_tht`, and holds one mask per `clean_image/` file under the *same
+  stem*. `cad_tht` additionally requires each mask to be the **same size** as its clean image, and its
+  label file to declare `pad`, `hole`, and a lead class — `pin_tip` or `pin`.
 
 ### `defect_spec.jsonl`
 
-One JSON object per defect type. Real rows from `datasets/phone_screen/defect_spec.jsonl`:
+One JSON object per defect type, read only by classic Auto Mask Placement. Real rows from
+`datasets/phone_screen/defect_spec.jsonl`:
 
 ```json
 {"defect_type": "Phone+oil", "spatial_dependency": "text", "roi_prompt_defect_location": "the entire mobile phone screen surface, excluding the phone frame and background"}
@@ -186,17 +203,17 @@ One JSON object per defect type. Real rows from `datasets/phone_screen/defect_sp
 
 One dataset can hold several textures at once — each texture is its own top-level folder under
 `{dataset_dir}`, with its own defect subfolders. Say your dataset has three textures: `bottle`
-(defects `crack`, `stain`), `cable` (defects `cut`, `bent`, `frayed`), and `screw` (defect `scratch`).
+(defects `chip`, `stain`), `cable` (defects `cut`, `bent`, `frayed`), and `screw` (defect `scratch`).
 The tree becomes:
 
 ```text
 datasets/mydata/
 ├── bottle/
 │   ├── anomaly_image/
-│   │   ├── crack/   0001.png  0002.png  …
+│   │   ├── chip/    0001.png  0002.png  …
 │   │   └── stain/   0001.png  0002.png  …
 │   ├── mask/
-│   │   ├── crack/   0001_mask.png  0002_mask.png  …
+│   │   ├── chip/    0001_mask.png  0002_mask.png  …
 │   │   └── stain/   0001_mask.png  0002_mask.png  …
 │   └── clean_image/ 0001.png  0002.png  …
 ├── cable/
@@ -219,7 +236,7 @@ datasets/mydata/
 `defect_spec.jsonl` — one row per `{texture}+{defect}` class (six rows here):
 
 ```json
-{"defect_type": "bottle+crack", "spatial_dependency": "text", "roi_prompt_defect_location": "the surface of the bottle"}
+{"defect_type": "bottle+chip", "spatial_dependency": "text", "roi_prompt_defect_location": "the surface of the bottle"}
 {"defect_type": "bottle+stain", "spatial_dependency": "text", "roi_prompt_defect_location": "the surface of the bottle"}
 {"defect_type": "cable+cut", "spatial_dependency": "text", "roi_prompt_defect_location": "the cable"}
 {"defect_type": "cable+bent", "spatial_dependency": "text", "roi_prompt_defect_location": "the cable"}
@@ -230,16 +247,17 @@ datasets/mydata/
 The matching fine-tuning recipe would then declare every `[texture, defect]` pair:
 
 ```yaml
-anomaly_types: [[bottle, crack], [bottle, stain], [cable, cut], [cable, bent], [cable, frayed], [screw, scratch]]
+anomaly_types: [[bottle, chip], [bottle, stain], [cable, cut], [cable, bent], [cable, frayed], [screw, scratch]]
 dataset_path: /path/to/datasets/mydata
 ```
 
 Each `[texture, defect]` pair points at `{dataset_path}/{texture}/anomaly_image/{defect}/` and its
-`mask/{defect}/` sibling, and produces the class string (`"bottle+crack"`, `"cable+cut"`, …) used in
+`mask/{defect}/` sibling, and produces the class string (`"bottle+chip"`, `"cable+cut"`, …) used in
 `defect_spec.jsonl`.
 
 ______________________________________________________________________
 
 ## Next step
 
-Continue to [3 · Auto Mask Placement](3-auto-mask-placement.md).
+Continue to [3 · Agentic Mask Generation](3-agentic-mask-generation.md), or to the classic
+[3 · Auto Mask Placement](3-auto-mask-placement.md).

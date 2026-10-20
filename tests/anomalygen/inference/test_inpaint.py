@@ -11,29 +11,45 @@ not exercised here.
 
 import glob
 import hashlib
+import os
 import pathlib
 import pickle
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
-from hydra.core.config_store import ConfigStore
+import yaml
 from PIL import Image
 
 import anomalygen
 import anomalygen.checkpoint.utils as ckpt_utils
 import anomalygen.inference.inpaint as inpaint_module
-from anomalygen.configs.texture.constants import BASE_CHECKPOINT_PATHS, DEFAULT_MODEL_SIZE, MODEL_SIZES
+from anomalygen.configs.texture.constants import (
+    BASE_CHECKPOINT_PATHS,
+    DEFAULT_MODEL_SIZE,
+    DEFAULT_SHIFT,
+    MODEL_SIZES,
+)
+from anomalygen.data.crop_geometry import plan_crop
+from anomalygen.data.utils import UNCONDITIONAL_CAPTION
 from anomalygen.inference.inpaint import (
     _base_checkpoint_for_experiment,
     _build_inpaint_batch_multi,
+    _is_legacy,
     _resolve_ft_model_pt,
+    _resolve_shift,
     _verify_overlay,
     build_inpaint_batch_fn,
-    build_inpaint_one,
     load_finetuned_model,
     load_for_inference,
 )
+
+
+def _plan_64():
+    """Plan for a 64x64 crop on a single-size 64 ladder: no resample, no padding."""
+    return plan_crop(32, 32, 64, 64, 2.0, 1.0, (64,), ratio_floor=1.5)
+
 
 # --- _resolve_ft_model_pt ------------------------------------------------------------------------
 
@@ -103,12 +119,12 @@ def test_resolve_missing_raises(tmp_path):
 _FULL_STATE = {
     "net.blocks.0.weight": 0,
     "net.blocks.0.lora_A.weight": 0,
-    "net.inpaint_class_emb": 0,
+    "net.text_prompt_emb": 0,
 }
 
 
 def test_verify_overlay_accepts_valid_subset():
-    ckpt = {"net.blocks.0.lora_A.weight": 1, "net.inpaint_class_emb": 1}
+    ckpt = {"net.blocks.0.lora_A.weight": 1, "net.text_prompt_emb": 1}
     assert _verify_overlay(ckpt, _FULL_STATE) is None  # no raise
 
 
@@ -120,39 +136,12 @@ def test_verify_overlay_rejects_unexpected_key():
 
 def test_verify_overlay_rejects_missing_trained_key():
     # Subset of the model (no unexpected keys) but missing a trained key -> would stay at base value.
-    ckpt = {"net.inpaint_class_emb": 1}  # lora_A missing
+    ckpt = {"net.text_prompt_emb": 1}  # lora_A missing
     with pytest.raises(ValueError):
         _verify_overlay(ckpt, _FULL_STATE)
 
 
 # --- _base_checkpoint_for_experiment --------------------------------------------------------------
-
-
-@pytest.fixture
-def register_experiment():
-    """Register throwaway ``experiment`` nodes in the (global) ConfigStore, and clean them up.
-
-    ``_base_checkpoint_for_experiment`` reads the BUILT node rather than the recipe file, so a
-    hand-registered node is enough to exercise it — no model build, no checkpoint, no GPU.
-    """
-    names = []
-
-    def _register(name, model_size=...):
-        expert_config = {} if model_size is ... else {"model_size": model_size}
-        ConfigStore.instance().store(
-            group="experiment",
-            package="_global_",
-            name=name,
-            node={"model": {"config": {"diffusion_expert_config": expert_config}}},
-        )
-        names.append(f"{name}.yaml")
-        return name
-
-    yield _register
-
-    repo = ConfigStore.instance().repo.get("experiment", {})
-    for key in names:
-        repo.pop(key, None)
 
 
 def test_base_checkpoint_follows_the_edge_size(register_experiment):
@@ -173,12 +162,14 @@ def test_base_checkpoint_rejects_unknown_size(register_experiment):
         _base_checkpoint_for_experiment(name)
 
 
-@pytest.mark.parametrize("label,model_size", [("absent", ...), ("null", None), ("empty", "")])
-def test_base_checkpoint_falls_back_to_the_default_size(register_experiment, label, model_size):
+@pytest.mark.parametrize(
+    "label,expert_config", [("absent", {}), ("null", {"model_size": None}), ("empty", {"model_size": ""})]
+)
+def test_base_checkpoint_falls_back_to_the_default_size(register_experiment, label, expert_config):
     # DELIBERATE, not an accident: a recipe that never mentions model_size (every recipe predating
     # the Edge size) resolves to the default size instead of failing. Pinned so the silent fallback
     # stays a decision — an unset size must never become "whatever size ran last".
-    name = register_experiment(f"unittest_size_unset_{label}", model_size=model_size)
+    name = register_experiment(f"unittest_size_unset_{label}", **expert_config)
     assert _base_checkpoint_for_experiment(name) == BASE_CHECKPOINT_PATHS[DEFAULT_MODEL_SIZE]
     assert BASE_CHECKPOINT_PATHS[DEFAULT_MODEL_SIZE] == "checkpoints/Cosmos3-Nano"
 
@@ -190,25 +181,16 @@ def test_size_table_and_default_agree():
     assert DEFAULT_MODEL_SIZE in MODEL_SIZES
 
 
-# --- build_inpaint_one --------------------------------------------------------------------------
+# --- build_inpaint_batch_fn ---------------------------------------------------------------------
 
 
-def test_build_inpaint_one_rejects_unknown_anomaly():
-    # The closure validates anomaly_name before touching the model, so a dummy model is fine.
-    inpaint_one = build_inpaint_one(model=object(), class_ids={"metal+scratch": 0}, num_steps=1, guidance=1.0)
-    img = Image.new("RGB", (16, 16))
-    mask = Image.new("L", (16, 16))
-    with pytest.raises(KeyError):
-        inpaint_one(img, mask, "unknown+type")
-
-
-def test_build_inpaint_batch_fn_rejects_unknown_anomaly():
+def test_build_inpaint_batch_fn_rejects_unknown_anomaly(stub_model):
     # Same guard, batched: unknown name fails before any model call.
-    fn = build_inpaint_batch_fn(model=object(), class_ids={"metal+scratch": 0}, num_steps=1, guidance=1.0, shift=5.0)
+    fn = build_inpaint_batch_fn(model=stub_model(shift=7), class_ids={"metal+scratch": 0}, num_steps=1, guidance=1.0)
     img = Image.new("RGB", (16, 16))
     mask = Image.new("L", (16, 16))
     with pytest.raises(KeyError):
-        fn([img], [mask], ["unknown+type"], [1])
+        fn([img], [mask], ["unknown+type"], [1], [_plan_64()])
 
 
 # --- _build_inpaint_batch_multi ------------------------------------------------------------------
@@ -220,11 +202,15 @@ class _StubNet:
 
 
 class _StubModel:
-    """Minimal surface build_inpaint_batch(_multi) reads; no real forward."""
+    """Minimal surface build_inpaint_batch(_multi) reads; no real forward.
+
+    ``config`` carries the scalar shift table ``_resolve_shift`` reads when the caller pins no shift.
+    """
 
     net = _StubNet()
     tensor_kwargs = {"dtype": torch.float32}
     input_caption_key = "ai_caption"
+    config = SimpleNamespace(rectified_flow_training_config=SimpleNamespace(shift=DEFAULT_SHIFT))
 
 
 def test_build_inpaint_batch_multi_merges_samples():
@@ -244,16 +230,155 @@ def test_build_inpaint_batch_multi_merges_samples():
     assert batch["edit_mask"].shape == (2, 1, 64, 64)
     assert batch["anomaly_class_id"].tolist() == [0, 1]
     assert batch[model.input_caption_key] == ["a b", "c d"]
+    # One unconditional prompt per sample, merged alongside the conditional captions.
+    assert batch["neg_" + model.input_caption_key] == [UNCONDITIONAL_CAPTION] * 2
+
+
+# --- CFG unconditional branch --------------------------------------------------------------------
+
+
+def test_the_batched_closure_feeds_the_unconditional_prompt():
+    # The batch key and has_negative_prompt must move together, or the framework rejects the batch.
+    model = _RecordingModel()
+    img, mask = _crop_pair()
+    build_inpaint_batch_fn(model, {"metal+scratch": 0}, num_steps=1, guidance=7.0)(
+        [img], [mask], ["metal+scratch"], [1], [_plan_64()]
+    )
+
+    assert model.has_negative_prompt == [True]
+    assert model.batches[0]["neg_" + model.input_caption_key] == [UNCONDITIONAL_CAPTION]
 
 
 # --- load_for_inference error path ---------------------------------------------------------------
 
 
-def test_load_for_inference_requires_experiment_name_for_module_recipe():
-    # A Python-module recipe yields no experiment name; without an explicit experiment= it must fail
-    # loudly (before any model load). "json" is importable and returns None from register_recipe.
-    with pytest.raises(ValueError):
-        load_for_inference("json", "unused_checkpoint")
+def test_load_for_inference_refuses_a_module_outside_the_allowed_namespaces(tmp_path):
+    # Registration runs before any model load, so a recipe module the loader will not import fails
+    # here, loudly. "json" is importable but not under an allowed namespace. The checkpoint is
+    # stamped so the legacy-recipe refusal, which comes first, stays out of the way.
+    with pytest.raises(ValueError, match="outside the allowed namespaces"):
+        load_for_inference("json", _pt(tmp_path, stamped=True))
+
+
+def _capture_parallelism_during_registration(monkeypatch, tmp_path):
+    """Run load_for_inference far enough to register, returning what the builder would have read."""
+    seen = {}
+
+    def _register(recipe, experiment=None, **_kwargs):
+        seen["value"] = os.environ.get("ANOMALYGEN_PARALLELISM")
+        raise ValueError("stop after registering")  # enough to reach the finally, no model load
+
+    monkeypatch.setattr(inpaint_module, "register_recipe", _register)
+    with pytest.raises(ValueError, match="stop after registering"):
+        load_for_inference("json", _pt(tmp_path, stamped=True))
+    return seen["value"]
+
+
+def test_load_for_inference_pins_unsharded_parallelism_while_registering(monkeypatch, tmp_path):
+    # Inference must never shard: ranks run different testcases, so the per-rank all-gather counts
+    # diverge and the collective hangs. The builder reads the variable during register_recipe, so
+    # that call is the only window where the pin has to hold.
+    monkeypatch.setenv("ANOMALYGEN_PARALLELISM", "fsdp")
+    assert _capture_parallelism_during_registration(monkeypatch, tmp_path) == "ddp"
+
+
+def test_load_for_inference_restores_parallelism_afterwards(monkeypatch, tmp_path):
+    # The pin is scoped to registration. Leaving it set would silently force any experiment built
+    # later in the same interpreter -- a training run in a notebook, say -- onto ddp.
+    monkeypatch.setenv("ANOMALYGEN_PARALLELISM", "fsdp")
+    _capture_parallelism_during_registration(monkeypatch, tmp_path)
+    assert os.environ["ANOMALYGEN_PARALLELISM"] == "fsdp"
+
+
+def test_load_for_inference_leaves_parallelism_unset_if_it_was(monkeypatch, tmp_path):
+    # Nothing set it before, so nothing should be set after either.
+    monkeypatch.delenv("ANOMALYGEN_PARALLELISM", raising=False)
+    _capture_parallelism_during_registration(monkeypatch, tmp_path)
+    assert "ANOMALYGEN_PARALLELISM" not in os.environ
+
+
+# --- legacy checkpoints ----------------------------------------------------------------------------
+# A fine-tuned .pt with no geometry stamp is a legacy checkpoint. load_for_inference reads its recipe
+# as legacy and hands the recipe's class listing down; load_finetuned_model stamps and reorders the
+# state in memory. Both halves are checked here without a real model.
+
+
+def _pt(tmp_path, stamped):
+    path = tmp_path / "iter_000000100.pt"
+    state = {"net.blk.lora_A": torch.zeros(2, 1, 1)}
+    if stamped:
+        state[ckpt_utils.GEOMETRY_STAMP_KEY] = {"crop_mode": "ratio"}
+    torch.save(state, path)
+    return str(path)
+
+
+def test_a_checkpoint_without_a_stamp_is_legacy(tmp_path):
+    assert _is_legacy(_pt(tmp_path, stamped=False))
+    assert not _is_legacy(_pt(tmp_path, stamped=True))
+
+
+@pytest.mark.parametrize("stamped", [False, True], ids=["legacy", "stamped"])
+def test_load_for_inference_reads_the_recipe_as_legacy_only_for_a_legacy_checkpoint(
+    tmp_path, monkeypatch, register_experiment, stamped
+):
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text(yaml.safe_dump({"anomaly_types": [["t", "small"], ["t", "big"]]}))
+    name = register_experiment("unit_legacy", model_size="nano")
+    seen = {}
+
+    def _register(recipe, experiment=None, legacy=False):
+        seen["legacy"] = legacy
+        return name
+
+    def _load(model_pt, base_checkpoint=None, experiment=None, legacy_class_order=None):
+        seen["order"] = legacy_class_order
+        return "model"
+
+    monkeypatch.setattr(inpaint_module, "register_recipe", _register)
+    monkeypatch.setattr(inpaint_module, "load_finetuned_model", _load)
+
+    assert load_for_inference(str(recipe), _pt(tmp_path, stamped)) == "model"
+    assert seen == {"legacy": not stamped, "order": None if stamped else [["t", "small"], ["t", "big"]]}
+
+
+class _TinyModel(torch.nn.Module):
+    """Stands in for the base network: one per-class LoRA tensor, a frozen layer, the config the stamp reads."""
+
+    def __init__(self, config, num_classes=2):
+        super().__init__()
+        self.net = torch.nn.Module()
+        self.net.blk = torch.nn.Module()
+        self.net.blk.lora_A = torch.nn.Parameter(torch.zeros(num_classes, 2, 3))
+        self.net.base = torch.nn.Linear(3, 3)
+        self.config = config
+        self.class_ladders = None
+
+
+def test_load_finetuned_model_stamps_and_reorders_a_legacy_checkpoint_in_memory(tmp_path, monkeypatch, stub_model):
+    # Listed class 0 = small (filled with 0), listed class 1 = big (filled with 1); the sorted order puts big first.
+    model_pt = tmp_path / "iter_000000100.pt"
+    torch.save({"net.blk.lora_A": torch.stack([torch.zeros(2, 3), torch.ones(2, 3)])}, model_pt)
+    model = _TinyModel(stub_model(ladder=(512,), crop_mode="ratio").config)
+    monkeypatch.setattr(inpaint_module, "load_model", lambda *a, **k: model)
+
+    loaded = load_finetuned_model(
+        str(model_pt), base_checkpoint="unused", legacy_class_order=[["t", "small"], ["t", "big"]]
+    )
+
+    assert loaded is model
+    assert model.net.blk.lora_A[0].eq(1.0).all() and model.net.blk.lora_A[1].eq(0.0).all()
+    assert model.class_ladders is None, "a legacy checkpoint carries no per-class caps"
+
+
+def test_load_finetuned_model_still_refuses_an_unstamped_checkpoint_without_a_class_order(
+    tmp_path, monkeypatch, stub_model
+):
+    # Only load_for_inference opts a checkpoint into the upgrade; a direct call keeps the strict rule.
+    model_pt = tmp_path / "iter_000000100.pt"
+    torch.save({"net.blk.lora_A": torch.zeros(2, 2, 3)}, model_pt)
+    monkeypatch.setattr(inpaint_module, "load_model", lambda *a, **k: _TinyModel(stub_model().config))
+    with pytest.raises(ValueError, match="legacy checkpoint"):
+        load_finetuned_model(str(model_pt), base_checkpoint="unused")
 
 
 # --- per-instance seed wiring (serial path) ------------------------------------------------------
@@ -264,15 +389,19 @@ def test_load_for_inference_requires_experiment_name_for_module_recipe():
 
 
 class _RecordingModel(_StubModel):
-    """``_StubModel`` plus the two hooks ``_generate_inpaint`` drives, recording what it saw."""
+    """``_StubModel`` plus the two hooks the inpaint closures drive, recording what it saw."""
 
     def __init__(self):
         self.seeds = []
         self.sources = []
+        self.batches = []
+        self.has_negative_prompt = []
 
-    def generate_samples_from_batch(self, batch, guidance=None, num_steps=None, shift=None, seed=None):
-        self.seeds.append(seed)
+    def generate_samples_from_batch(self, batch, has_negative_prompt=False, **kwargs):
+        self.seeds.append(kwargs.get("seed"))
         self.sources.append(batch["images"][0].clone())  # [source, cond] -> source item
+        self.batches.append(batch)
+        self.has_negative_prompt.append(has_negative_prompt)
         return {"vision": [torch.zeros(1, 3, 1, 8, 8)]}
 
     def decode(self, latent):
@@ -286,35 +415,14 @@ def _crop_pair(size=64, fill=120):
     return img, Image.fromarray(m, "L")
 
 
-def test_build_inpaint_one_advances_the_seed_per_instance():
-    model = _RecordingModel()
-    img, mask = _crop_pair()
-    fn = build_inpaint_one(model, {"t+d": 0}, num_steps=1, guidance=1.0, model_input_size=64, seed=500)
-
-    for _ in range(3):
-        fn(img, mask, "t+d")
-
-    # n-th call is seeded seed+n, so a sample's instances never share a noise draw.
-    assert [s[0] for s in model.seeds] == [500, 501, 502]
-
-    # ... and that seed is what actually builds the source item: call n must match a fresh closure
-    # started at 500+n. Asserting merely that consecutive sources DIFFER would pass on the global
-    # RNG too, i.e. it would still pass with the seeding dropped — verified by mutation.
-    for n in (1, 2):
-        ref = _RecordingModel()
-        build_inpaint_one(ref, {"t+d": 0}, num_steps=1, guidance=1.0, model_input_size=64, seed=500 + n)(
-            img, mask, "t+d"
-        )
-        assert torch.equal(model.sources[n], ref.sources[0])
-
-
-def test_build_inpaint_one_is_reproducible_across_closures():
-    """Two closures built with the same seed produce identical source items — the --base_seed contract."""
+def test_batched_closures_are_reproducible_for_the_same_seed():
+    """Two closures given the same seed produce identical source items — the --base_seed contract.
+    The per-instance offset (depth j -> seed + j) belongs to the orchestrator and is tested there."""
     img, mask = _crop_pair()
     runs = []
     for _ in range(2):
         model = _RecordingModel()
-        build_inpaint_one(model, {"t+d": 0}, num_steps=1, guidance=1.0, model_input_size=64, seed=77)(img, mask, "t+d")
+        build_inpaint_batch_fn(model, {"t+d": 0}, num_steps=1, guidance=1.0)([img], [mask], ["t+d"], [77], [_plan_64()])
         runs.append(model.sources[0])
     assert torch.equal(runs[0], runs[1])
 
@@ -485,3 +593,61 @@ def test_opted_in_base_weight_verification_passes_an_untouched_shard(tmp_path, m
 
     with pytest.raises(RuntimeError, match="reached load_model"):
         load_finetuned_model(_ft_checkpoint(tmp_path), base_checkpoint=str(ckpt_dir / "Cosmos3-Nano"))
+
+
+# --- batched closure: mixed input sizes ----------------------------------------------------------
+
+
+class _ScatterModel(_StubModel):
+    """Returns a crop tagged with its own sample's seed, so a mis-scatter is visible in the output."""
+
+    def generate_samples_from_batch(self, batch, seed=None, **kwargs):
+        return {"vision": [torch.full((1, 3, 1, 8, 8), s / 100.0) for s in seed]}
+
+    def decode(self, latent):
+        return latent  # _decode_to_pil maps [-1,1] -> [0,255]
+
+
+def _solid(img):
+    return int(np.asarray(img)[0, 0, 0])
+
+
+def test_batched_closure_returns_crops_in_input_order():
+    """One sampler call for the whole batch; results must stay in the caller's order. Getting that
+    wrong pastes one sample's crop into another's image."""
+    sizes = [64, 512, 64]
+    crops = [Image.fromarray(np.full((n, n, 3), 120, np.uint8), "RGB") for n in sizes]
+    masks = []
+    for n in sizes:
+        m = np.zeros((n, n), np.uint8)
+        m[n // 4 : 3 * n // 4, n // 4 : 3 * n // 4] = 255
+        masks.append(Image.fromarray(m, "L"))
+    plans = [plan_crop(n // 2, n // 2, n, n, 2.0, 1.0, (n,), ratio_floor=1.5) for n in sizes]
+    seeds = [10, 20, 30]
+
+    fn = build_inpaint_batch_fn(
+        _ScatterModel(),
+        {"t+d": 0},
+        num_steps=1,
+        guidance=1.0,
+    )
+    got = fn(crops, masks, ["t+d"] * 3, seeds, plans)
+
+    assert [_solid(o) for o in got] == [int(round((s / 100.0 + 1) * 127.5)) for s in seeds]
+    assert len({_solid(o) for o in got}) == 3  # the three seeds really are distinguishable
+    assert [o.size for o in got] == [(n, n) for n in sizes]
+
+
+# --- sampler shift ------------------------------------------------------------------------------
+
+
+def test_shift_comes_from_the_recipe_not_a_default(stub_model):
+    # The shift is read off the recipe the model was built from. A value distinct from DEFAULT_SHIFT,
+    # so a body that returned the default would fail here.
+    assert _resolve_shift(stub_model(shift=7)) == 7.0
+
+
+def test_shift_raises_when_the_recipe_does_not_carry_one():
+    # Silently substituting a default would desync the sampler from the schedule training used.
+    with pytest.raises(AttributeError, match="rectified_flow_training_config.shift"):
+        _resolve_shift(SimpleNamespace(config=SimpleNamespace()))

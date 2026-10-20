@@ -258,9 +258,21 @@ def test_aq_rank_nan_nn_sorts_last():
 
 
 def test_aq_rank_small_set_falls_back_to_nn_rank():
-    nn = [0.2, 0.9, 0.5, 0.1]  # n=4 < _COMPASS_MIN_N -> no compass
+    nn = [0.2, 0.9, 0.5, 0.1]  # n=4 < COMPASS_MIN_N -> no compass
     q = aq_module.compute_aq_rank_scores(_rows(nn, precision=[0.9, 0.1, 0.5, 0.2]))
     assert list(np.argsort(q)) == list(np.argsort(nn))  # order == nn order, axis ignored
+
+
+def test_aq_rank_compass_api_preserves_scores_and_returns_only_consumed_diagnostics():
+    xs = np.linspace(0, 1, 6)
+    rows = _rows(xs, precision=xs, completeness=[0.5] * 6, boundary_iou=[0.5] * 6)
+
+    scores, compass = aq_module.compute_aq_rank_with_compass(rows)
+
+    assert np.array_equal(scores, aq_module.compute_aq_rank_scores(rows))
+    assert set(compass) == {"pool_size", "axes"}
+    assert compass["pool_size"] == 6
+    assert all(set(axis) == {"auroc", "sign"} for axis in compass["axes"].values())
 
 
 def _write_rgb(path, arr):

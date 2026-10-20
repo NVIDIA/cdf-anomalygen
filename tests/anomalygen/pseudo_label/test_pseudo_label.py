@@ -691,3 +691,123 @@ def test_well_formed_caption_is_not_warned_about(monkeypatch):
     cap = _dummy_captioner()
     cap.postprocess_response("<answer>\ncaption\n\n**Anomaly 1**: a scratch\n</answer>", num_bboxes=1)
     assert warnings == []
+
+
+# Placement: a model that fits on one GPU stays on one GPU. Sharding it only adds device-to-device
+# copies of the hidden state, and a host that corrupts those copies turns them into a handful of
+# nan/+inf logits. These tests never touch a GPU: the memory probe and the load are stubbed, so they
+# run the same on a CPU-only runner, a single-GPU box and a multi-GPU host.
+
+_WEIGHTS = 1000  # arbitrary unit; the rule is a ratio, not a size
+_NEED = int(_WEIGHTS * (1 + caption_mod._PLACEMENT_HEADROOM))  # what one GPU must have free
+
+
+@pytest.mark.parametrize(
+    "free_bytes, expected",
+    [
+        pytest.param([_NEED], {"": "cuda:0"}, id="single gpu with exactly the headroom"),
+        pytest.param([_NEED - 1], "auto", id="single gpu one byte short"),
+        pytest.param([_NEED // 2, 10 * _NEED, 2 * _NEED], {"": "cuda:1"}, id="roomiest of several"),
+        pytest.param([3 * _NEED, 3 * _NEED, _NEED], {"": "cuda:0"}, id="tie goes to the lowest index"),
+        pytest.param([_NEED - 1] * 4, "auto", id="none big enough: split"),
+        pytest.param([], "auto", id="no gpu: cpu path"),
+    ],
+)
+def test_device_map_places_on_one_gpu_only_when_it_fits(free_bytes, expected):
+    assert caption_mod._device_map(_WEIGHTS, free_bytes) == expected
+
+
+def test_device_map_defers_to_auto_when_the_size_is_unknown():
+    """A hub id has no local weights to measure, so nothing can be promised about fitting."""
+    assert caption_mod._device_map(None, [10 * _NEED]) == "auto"
+
+
+def test_checkpoint_bytes_reads_the_index_metadata(tmp_path):
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"metadata": {"total_size": 12345}}))
+    (tmp_path / "shard.safetensors").write_bytes(b"x" * 10)  # ignored while the index has a total
+    assert caption_mod._checkpoint_bytes(str(tmp_path)) == 12345
+
+
+def test_checkpoint_bytes_sums_the_shards_without_an_index(tmp_path):
+    (tmp_path / "transformer").mkdir()
+    (tmp_path / "transformer" / "a.safetensors").write_bytes(b"x" * 7)
+    (tmp_path / "b.safetensors").write_bytes(b"y" * 5)
+    (tmp_path / "config.json").write_text("{}")
+    assert caption_mod._checkpoint_bytes(str(tmp_path)) == 12
+
+
+def test_checkpoint_bytes_is_unknown_for_a_hub_id(tmp_path):
+    assert caption_mod._checkpoint_bytes("nvidia/Cosmos3-Nano-that-is-not-local") is None
+    assert caption_mod._checkpoint_bytes(str(tmp_path)) is None  # a directory with no weights
+
+
+def _stub_model_load(monkeypatch, tmp_path, free_bytes, hf_device_map=None):
+    """Fake the checkpoint, the CUDA memory probe and both ``from_pretrained`` calls.
+
+    ``free_bytes`` has one entry per visible GPU; empty means no CUDA. ``hf_device_map`` is what the
+    fake model reports after loading (transformers leaves it unset for a single-device load).
+    Returns the kwargs recorded from each model load and the info and warning lines logged.
+    """
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"metadata": {"total_size": _WEIGHTS}}))
+    calls, infos, warnings = [], [], []
+
+    class _Model:
+        device = "cuda:0" if free_bytes else "cpu"
+
+    _Model.hf_device_map = hf_device_map
+
+    monkeypatch.setattr(caption_mod, "_resolve_model_path", lambda _id: str(tmp_path))
+    monkeypatch.setattr(caption_mod.AutoProcessor, "from_pretrained", staticmethod(lambda _p: "processor"))
+    monkeypatch.setattr(
+        caption_mod.Cosmos3OmniForConditionalGeneration,
+        "from_pretrained",
+        staticmethod(lambda path, **kw: (calls.append(kw), _Model())[1]),
+    )
+    monkeypatch.setattr(caption_mod.torch.cuda, "is_available", lambda: bool(free_bytes))
+    monkeypatch.setattr(caption_mod.torch.cuda, "device_count", lambda: len(free_bytes))
+    monkeypatch.setattr(caption_mod.device_placement, "free_bytes", lambda: list(free_bytes))
+    monkeypatch.setattr(caption_mod.log, "info", infos.append)
+    monkeypatch.setattr(caption_mod.log, "warning", warnings.append)
+    return calls, infos, warnings
+
+
+@pytest.mark.parametrize(
+    "free_bytes, expected",
+    [
+        pytest.param([], "auto", id="cpu only"),
+        pytest.param([_NEED], {"": "cuda:0"}, id="one gpu that fits"),
+        pytest.param([_NEED - 1], "auto", id="one gpu too small"),
+        pytest.param([_NEED, 4 * _NEED, 2 * _NEED], {"": "cuda:1"}, id="several gpus: roomiest"),
+    ],
+)
+def test_load_hands_the_placement_to_from_pretrained(monkeypatch, tmp_path, free_bytes, expected):
+    calls, infos, warnings = _stub_model_load(monkeypatch, tmp_path, free_bytes)
+    cap = _dummy_captioner()
+    cap.load()
+    assert len(calls) == 1
+    assert calls[0]["device_map"] == expected
+    assert cap.processor == "processor"
+    # The decision is logged once with the versions it has to be triaged against.
+    assert len(infos) == 1
+    assert f"device_map={expected}" in infos[0] and "transformers" in infos[0] and "torch" in infos[0]
+    # A single-device placement is the quiet path.
+    assert warnings == []
+
+
+def test_load_warns_when_the_model_ends_up_sharded(monkeypatch, tmp_path):
+    """The split is legitimate when nothing fits, but it is the one placement where a bad
+    device-to-device path can reach the logits, so it is announced with the way to tell them apart."""
+    sharded = {"model.visual": 0, "model.language_model.layers.0": 0, "model.language_model.layers.1": 1, "lm_head": 1}
+    calls, _, warnings = _stub_model_load(monkeypatch, tmp_path, [_NEED - 1, _NEED - 1], hf_device_map=sharded)
+    _dummy_captioner().load()
+    assert calls[0]["device_map"] == "auto"
+    assert len(warnings) == 1
+    assert "2 devices" in warnings[0] and "single GPU" in warnings[0]
+
+
+def test_load_is_idempotent(monkeypatch, tmp_path):
+    calls, _, _ = _stub_model_load(monkeypatch, tmp_path, [_NEED])
+    cap = _dummy_captioner()
+    cap.load()
+    cap.load()
+    assert len(calls) == 1

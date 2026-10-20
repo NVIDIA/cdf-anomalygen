@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Unified ROI → AMP pipeline: auto-routes between CAD-based and Text-based ROI generation.
+Unified ROI → AMP pipeline: auto-routes between CAD-, THT-, text- and free-based ROI generation.
 
-Routing logic: if a sample has "cad_mask" → cad2roi path, otherwise → text2roi path.
+Routing logic (``_get_sample_route``): a defect whose ``spatial_dependency`` is "cad_tht" takes the
+tht2roi path; otherwise a sample carrying "cad_mask" takes the cad2roi path, and the rest split on
+"free" vs "text".
 
 Usage:
     python -m anomalygen.scripts.auto_mask_placement.roi_place \
@@ -22,6 +24,9 @@ Input JSON format: list of samples, each with:
         - cad_mask:     path to CAD semantic segmentation mask (PNG)
         - cad_mask_label:   path to color label JSON
         - submask:      path to defect submask (null for missing)
+
+    CAD_THT route (spatial_dependency "cad_tht"): the same three fields, but the mask carries the
+    disjoint pad / hole / pin classes that become regions B / C / D.
 
     Text route (when cad_mask is absent):
         - submask:      path to defect submask (null → ROI only)
@@ -59,8 +64,17 @@ from anomalygen.auto_mask_placement.text2roi import (
     postprocess_sam_mask,
     resize_for_sam,
 )
+from anomalygen.auto_mask_placement.tht2roi import (
+    BRIDGE,
+    RingMaskPlacer,
+    THTBridgeMaskPlacer,
+    THTToROIGenerator,
+    roi_rule,
+)
 from anomalygen.configs.texture.constants import DEFAULT_CROP_RATIO, DEFAULT_GUIDANCE, DEFAULT_NUM_STEPS
-from anomalygen.data.utils import validate_anomaly_type
+from anomalygen.data.utils import list_images, validate_anomaly_type
+
+_ROI_MASK_PNG = "roi_mask.png"
 
 # ── Visualization colors ──────────────────────────────────────────────────────
 ROI_COLOR = np.array([0, 200, 0], dtype=np.float32)
@@ -69,6 +83,11 @@ MASK_COLOR = np.array([0, 220, 255], dtype=np.float32)
 CAD_MASK_COLOR = np.array([255, 140, 0], dtype=np.float32)
 BBOX_COLOR = (0, 0, 255)
 POINT_COLOR = (0, 255, 255)
+
+# Ceiling on placements one pair record may request. The pair file is data, not code: a corrupt or
+# hand-edited n_seeds must not turn a single record into an unbounded placement loop. Far above any
+# allocation roi_pair produces (n_seeds = ceil(allocation / pair budget)), so it only bites on garbage.
+MAX_SEEDS_PER_RECORD = 10_000
 
 
 # ── Defect-description / routing helpers ──────────────────────────────────────
@@ -97,10 +116,19 @@ def _load_defect_descriptions(jsonl_path):
 
 
 def _get_sample_route(sample, spatial_deps):
-    """Determine route: 'free', 'cad', or 'text'."""
+    """Determine route: 'free', 'cad', 'cad_tht', or 'text'.
+
+    ``cad_tht`` is tested first because its records also carry ``cad_mask`` — the THT semantic mask
+    lives at the same path — so the ``cad`` test below would otherwise claim them. The check is a
+    guarded early return rather than a rewrite that makes ``spatial_dependency`` authoritative for
+    every route: no ``cad`` / ``text`` / ``free`` defect can have this value, so all three reach
+    exactly the code they reached before.
+    """
+    dep = spatial_deps.get(sample["defect_type"], "text")
+    if dep == "cad_tht":
+        return "cad_tht"
     if "cad_mask" in sample and sample["cad_mask"] is not None:
         return "cad"
-    dep = spatial_deps.get(sample["defect_type"], "text")
     if dep == "free":
         return "free"
     return "text"
@@ -211,7 +239,7 @@ def _process_free_sample(sample, output_dir, n_seeds, base_seed, min_area_ratio=
 
     # ROI = entire image (white mask)
     roi_mask = np.full((ori_h, ori_w), 255, dtype=np.uint8)
-    roi_mask_path = str(assets / "roi_mask.png")
+    roi_mask_path = str(assets / _ROI_MASK_PNG)
     Image.fromarray(roi_mask).save(roi_mask_path)
 
     if not submask_path or not os.path.exists(submask_path):
@@ -327,7 +355,7 @@ def _process_text2roi_sample(
     img_np = np.array(pil)
 
     # ROI cache: reuse assets/roi_mask.png (skip the expensive detect + SAM2) unless refreshing.
-    roi_mask_png = assets / "roi_mask.png"
+    roi_mask_png = assets / _ROI_MASK_PNG
     meta_path = assets / "roi_meta.json"
 
     if roi_mask_png.exists() and not refresh_roi:
@@ -410,7 +438,7 @@ def _process_text2roi_sample(
             "seeds": {},
         }
 
-    roi_mask_path = str(assets / "roi_mask.png")
+    roi_mask_path = str(assets / _ROI_MASK_PNG)
     submask_path = _preprocess_submask(submask_path, sample)
     submask_stem = Path(submask_path).stem
     base_area = _mask_area_from_path(submask_path)
@@ -597,18 +625,138 @@ def _process_cad2roi_sample(sample, output_dir, n_seeds, base_seed, n_instances=
     }
 
 
+# ── CAD_THT (through-hole joint) processing ──────────────────────────────────
+
+
+def _process_cad_tht_sample(sample, output_dir, n_seeds, base_seed, n_instances=1, roi_only=False):
+    """Place one THT defect onto one joint crop.
+
+    Reads the same artefacts as the cad route — ``cad_mask`` + ``cad_mask_label`` — but decodes them
+    into the disjoint pad/hole/pin regions (B/C/D) that the THT ROI rules are written against.
+
+    The output directory is keyed on the CLEAN image's stem, not the cad_mask's. They are required to
+    be equal, but ``_build_testcase_jsonl`` looks masks up by clean stem, so keying on the clean image
+    directly means a stem mismatch surfaces upstream in the preflight rather than as rows silently
+    vanishing from the JSONL.
+    """
+    clean_image_path = sample["clean_image"]
+    defect_type = sample["defect_type"]
+    submask_path = sample.get("submask")
+
+    tht_defect = defect_type.split("+", 1)[1] if "+" in defect_type else defect_type
+
+    name = Path(clean_image_path).stem
+    out = Path(output_dir) / name / defect_type
+    assets = out / "assets"
+    out.mkdir(parents=True, exist_ok=True)
+    assets.mkdir(parents=True, exist_ok=True)
+
+    result = {"name": name, "defect_type": defect_type, "route": "tht2roi", "n_candidates": 0, "seeds": {}}
+
+    # Each of these is one sample's problem, reported as that sample's status -- the shape the cad
+    # and free routes already use. Left to raise, every one took the whole roi_place run down, and
+    # this module runs standalone on a hand-written pair file where all three are easy to write.
+    #
+    # Skipping is only safe because run_pipeline now counts the testcase rows against num_sdg: a
+    # skipped sample is a shortfall, and a shortfall fails the run with these statuses named from
+    # summary.json. Without that gate this would trade a loud crash for a quietly short batch.
+    missing = [k for k in ("cad_mask", "cad_mask_label") if not sample.get(k)]
+    if missing:
+        log.warning(f"  {name}/{defect_type}: pair record has no {' and no '.join(missing)}, skipping")
+        return {**result, "status": "NO_CAD_MASK"}
+    cad_mask_path = sample["cad_mask"]
+    cad_mask_label = sample["cad_mask_label"]
+
+    # Only when there is going to be a placement. --roi_only is the ROI cache warm-up
+    # (roi_place_pipeline documents it as such) and never opens the submask, so demanding one here
+    # skipped the sample before a single candidate or overlay was written -- on the one run whose
+    # entire output is those overlays. The free and text routes null the submask out for roi_only at
+    # :338 for the same reason, and this route did too before the guard was added.
+    if not roi_only and (not submask_path or not os.path.exists(submask_path)):
+        log.warning(f"  {name}/{defect_type}: no submask for AMP, skipping")
+        return {**result, "status": "NO_SUBMASK"}
+
+    # roi_rule raises on an unrecognised class -- deliberately, so it cannot degrade into an empty
+    # candidate list that reads as "found nowhere to go". Asked here, where one bad row is one
+    # skipped sample rather than the end of the run.
+    try:
+        roi_rule(tht_defect)
+    except ValueError as exc:
+        log.warning(f"  {name}/{defect_type}: {exc}, skipping")
+        return {**result, "status": "UNKNOWN_DEFECT"}
+
+    cad_img = np.array(Image.open(cad_mask_path).convert("RGB"))
+    clean_img = np.array(Image.open(clean_image_path).convert("RGB"))
+
+    # roi_allocate's preflight already rejects this for a dataset, but roi_place also runs standalone
+    # on a hand-written pair file. Everything below is built at the cad_mask's resolution, and the
+    # overlays index the clean image with a mask of that shape -- a mismatch would otherwise surface
+    # as an opaque numpy IndexError instead of the dataset problem it is.
+    if cad_img.shape[:2] != clean_img.shape[:2]:
+        log.warning(
+            f"  {name}/{defect_type}: cad_mask {cad_img.shape[1]}x{cad_img.shape[0]} != clean_image "
+            f"{clean_img.shape[1]}x{clean_img.shape[0]}, skipping"
+        )
+        return {**result, "status": "SIZE_MISMATCH"}
+
+    gen = THTToROIGenerator(cad_mask_label)
+    joints, img_shape = gen.parse_joints(cad_mask_path)
+    cands = gen.generate_candidates(joints, tht_defect)
+
+    if not cands:
+        log.warning(f"  {name}/{defect_type}: no ROI candidates from {len(joints)} joint(s), skipping")
+        return {**result, "status": "NO_CANDIDATES"}
+
+    roi_all = _sum_masks(cands)
+    Image.fromarray(_overlay(cad_img, roi_all, CAD_ROI_COLOR)).save(assets / "roi_cad.png")
+    Image.fromarray(_overlay(clean_img, roi_all, CAD_ROI_COLOR)).save(assets / "roi_real.png")
+    for i, cand in enumerate(cands):
+        Image.fromarray(cand.mask).save(assets / f"roi_{i}_mask.png")
+
+    if roi_only:
+        log.info(f"  {name}/{defect_type}: {len(cands)} ROIs (roi-only)")
+        return {**result, "status": "ROI_ONLY", "n_candidates": len(cands)}
+
+    submask_path = _preprocess_submask(submask_path, sample)
+    prefix = f"{Path(submask_path).stem}__"
+
+    seed_results = {}
+    if tht_defect == BRIDGE:
+        # bridge takes the JOINTS, not the candidates: it is not confined to a region, so the ROI
+        # above is an overlay only and the fit is tested against the pad ring and the crop edge.
+        results = THTBridgeMaskPlacer().place_all(
+            submask_path, joints, img_shape, n_instances=n_instances, n_seeds=n_seeds, base_seed=base_seed
+        )
+    else:
+        results = RingMaskPlacer().place_all(
+            submask_path, cands, img_shape, n_instances=n_instances, n_seeds=n_seeds, base_seed=base_seed
+        )
+    for seed_i, (n_req, n_placed, mask, undersized) in results.items():
+        idx = seed_i - 1
+        if mask is None:
+            seed_results[idx] = {"status": "FAILED", "n_requested": n_req, "n_placed": 0}
+            continue
+        _save_cad_seed(mask, idx, prefix, out, assets, cad_img, clean_img)
+        # SMALL outranks PARTIAL: a seed that placed every ROI it was asked for but kept a sliver of
+        # one of them is worse to receive than one that placed fewer well, because the sliver is
+        # inpainted as a full defect. The free and text routes use the same label for the same thing.
+        if undersized:
+            status = "SMALL"
+        else:
+            status = "OK" if n_placed >= n_req else "PARTIAL"
+        seed_results[idx] = {"status": status, "n_requested": n_req, "n_placed": n_placed}
+
+    n_ok = sum(1 for s in seed_results.values() if s["status"] == "OK")
+    log.info(f"  {name}/{defect_type}: {len(cands)} ROIs, {n_ok}/{n_seeds} seeds OK")
+    return {**result, "status": "OK", "n_candidates": len(cands), "seeds": seed_results}
+
+
 # ── SDG JSONL (folds in build_jsonl.py + verify_jsonl.py) ────────────────────
-
-
-def _list_images(d):
-    exts = {".png", ".jpg", ".jpeg", ".bmp"}
-    d = Path(d)
-    return sorted(p for p in d.iterdir() if p.suffix.lower() in exts) if d.is_dir() else []
 
 
 def _all_multi_instance_masks(mask_dir):
     """True only if EVERY training submask in mask_dir has ≥2 connected components."""
-    imgs = _list_images(mask_dir)
+    imgs = list_images(mask_dir)
     if not imgs:
         return False
     for p in imgs:
@@ -674,7 +822,6 @@ def _build_testcase_jsonl(samples, output_dir, jsonl_path, guidance=None, crop_r
                     "image_filename": str(clean_img),
                     "mask_filename": str(mask_path),
                     "anomaly_type": full_type,
-                    "crop_and_paste": True,
                     "num_generated_images": 1,
                     "poisson_blend": False,
                     "iteration_generation_max_instance": iter_max,
@@ -719,7 +866,8 @@ def _verify_and_resize_jsonl(jsonl_path, cache_dir):
             resized_im.save(out_path)
         e["mask_filename"] = str(out_path)
         resized += 1
-    Path(jsonl_path).write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    with open(jsonl_path, "w") as fp:
+        fp.write("\n".join(json.dumps(e) for e in entries) + "\n")
     log.info(f"verified {len(entries)} entries (resized={resized}, missing={missing})")
     return missing
 
@@ -767,30 +915,38 @@ def main(argv=None):
     with open(args.input_pair_path) as f:
         samples = json.load(f)
 
-    # Partition samples into three routes
+    # Partition samples by route. Every route is named explicitly and an unrecognised one raises:
+    # this used to end in a catch-all `else: free_indices.append(i)`, which would silently place a
+    # new route's samples anywhere in the image and produce plausible-looking masks in the wrong spot.
     text_indices = []
     cad_indices = []
+    tht_indices = []
     free_indices = []
+    _buckets = {"text": text_indices, "cad": cad_indices, "cad_tht": tht_indices, "free": free_indices}
     for i, s in enumerate(samples):
         route = _get_sample_route(s, spatial_deps)
-        if route == "text":
-            text_indices.append(i)
-        elif route == "cad":
-            cad_indices.append(i)
-        else:
-            free_indices.append(i)
+        if route not in _buckets:
+            raise ValueError(f"sample {i} ({s['defect_type']}): unhandled route {route!r}")
+        _buckets[route].append(i)
 
     log.info(
         f"Loaded {len(samples)} samples "
         f"({len(text_indices)} text2roi, {len(cad_indices)} cad2roi, "
-        f"{len(free_indices)} free)"
+        f"{len(tht_indices)} tht2roi, {len(free_indices)} free)"
     )
 
     # roi_pair stamps each record with the seed count its own defect type needs; --n_seeds is the
     # fallback for hand-written pair files. The stride uses the max so per-sample seed ranges stay
     # disjoint however the counts vary — overlapping ranges would repeat placements across samples.
+    # The per-record value is clamped: it drives the placement loops, and comes from a file.
     def _n_seeds_of(sample):
-        return int(sample.get("n_seeds") or args.n_seeds)
+        return min(int(sample.get("n_seeds") or args.n_seeds), MAX_SEEDS_PER_RECORD)
+
+    # Said once per record here; _n_seeds_of itself is called several times per record.
+    for s in samples:
+        requested = int(s.get("n_seeds") or args.n_seeds)
+        if requested > MAX_SEEDS_PER_RECORD:
+            log.warning(f"n_seeds={requested} for {s.get('clean_image')} capped at {MAX_SEEDS_PER_RECORD}")
 
     seed_stride = max((_n_seeds_of(s) for s in samples), default=args.n_seeds)
     # Same-type records differ: the last one carries the remainder, so a plain dict comprehension
@@ -810,7 +966,7 @@ def main(argv=None):
 
         def _roi_cached(i):
             s = samples[i]
-            roi = Path(args.output_dir) / Path(s["clean_image"]).stem / s["defect_type"] / "assets" / "roi_mask.png"
+            roi = Path(args.output_dir) / Path(s["clean_image"]).stem / s["defect_type"] / "assets" / _ROI_MASK_PNG
             return roi.exists()
 
         need_model = args.refresh_roi or any(not _roi_cached(i) for i in text_indices)
@@ -889,6 +1045,30 @@ def main(argv=None):
             )
             all_results[idx] = result
 
+    # ── THT2ROI path (CPU-bound) ─────────────────────────────────────────
+    if tht_indices:
+        log.info("Processing THT2ROI samples...\n")
+        # -1 means "a random count in [1, n_candidates]" everywhere else, which on a THT crop that
+        # caught a neighbouring joint would paint two defects. One joint carries one defect, because
+        # the generated crop is composited back against a single joint id. An explicit count is
+        # still honoured, so asking for more remains possible.
+        tht_n_instances = args.n_instances if args.n_instances > 0 else 1
+        if args.n_instances != tht_n_instances:
+            log.info(f"cad_tht: --n_instances {args.n_instances} -> {tht_n_instances} (one defect per joint)")
+        for idx in tht_indices:
+            sample = samples[idx]
+            log.info(f"[{idx + 1}/{total}] {sample['clean_image']} -> {sample['defect_type']}")
+            sample_seed = args.seed + idx * seed_stride * args.max_area_retries
+            result = _process_cad_tht_sample(
+                sample,
+                args.output_dir,
+                _n_seeds_of(sample),
+                sample_seed,
+                n_instances=tht_n_instances,
+                roi_only=args.roi_only,
+            )
+            all_results[idx] = result
+
     # ── Summary ──────────────────────────────────────────────────────────
     os.makedirs(args.output_dir, exist_ok=True)
     summary_path = os.path.join(args.output_dir, "summary.json")
@@ -898,7 +1078,8 @@ def main(argv=None):
 
     # Stats
     log.info(
-        f"\nTotal: {total} samples ({len(text_indices)} text2roi, {len(cad_indices)} cad2roi, {len(free_indices)} free)"
+        f"\nTotal: {total} samples ({len(text_indices)} text2roi, {len(cad_indices)} cad2roi, "
+        f"{len(tht_indices)} tht2roi, {len(free_indices)} free)"
     )
 
     for route, indices in [("text2roi", text_indices), ("free", free_indices)]:
@@ -911,11 +1092,13 @@ def main(argv=None):
         seeds_str = f", {n_ok}/{n_st} seeds OK" if n_st > 0 else ""
         log.info(f"{route}: {has_roi}/{len(results)} with ROI{seeds_str}")
 
-    if cad_indices:
-        cad_results = [all_results[i] for i in cad_indices]
-        log.info(f"\ncad2roi:")
-        for dt in sorted(set(r["defect_type"] for r in cad_results)):
-            dt_results = [r for r in cad_results if r["defect_type"] == dt]
+    for route, indices in [("cad2roi", cad_indices), ("tht2roi", tht_indices)]:
+        if not indices:
+            continue
+        route_results = [all_results[i] for i in indices]
+        log.info(f"\n{route}:")
+        for dt in sorted(set(r["defect_type"] for r in route_results)):
+            dt_results = [r for r in route_results if r["defect_type"] == dt]
             n_with_roi = sum(1 for r in dt_results if r["n_candidates"] > 0)
             n_ok = sum(sum(1 for s in r["seeds"].values() if s["status"] == "OK") for r in dt_results)
             n_st = sum(len(r["seeds"]) for r in dt_results)

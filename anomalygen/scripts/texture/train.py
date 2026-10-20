@@ -62,11 +62,10 @@ def launch(config, dry_run: bool = False) -> None:
         log.info("Dry run — config validated, skipping training.")
         return
 
-    # Persist the console log to the run dir as stdout.log. The framework's trainer only does
-    # this under COSMOS_INTERNAL=1 (which also flips other internal-only paths), so we add the
-    # file sink here for the default build — guarded by `not INTERNAL` to avoid double-logging
-    # when the framework already writes it. Added before the trainer/model build so it captures
-    # the (slow, one-time) torch.compile warmup. loguru's sink filters to rank 0.
+    # Persist the console log to the run dir as stdout.log. The framework's trainer writes this
+    # file only when its INTERNAL flag is set, so add the sink here otherwise, and skip it when
+    # the framework already writes it. Added before the trainer/model build so it captures the
+    # (slow, one-time) torch.compile warmup. loguru's sink filters to rank 0.
     if not INTERNAL and distributed.is_rank0():
         os.makedirs(config.job.path_local, exist_ok=True)
         log.init_loguru_file(f"{config.job.path_local}/stdout.log")
@@ -81,6 +80,16 @@ def launch(config, dry_run: bool = False) -> None:
         model = hydra.utils.instantiate(config.model)
         dataloader_train = hydra.utils.instantiate(config.dataloader_train)
         dataloader_val = hydra.utils.instantiate(config.dataloader_val)
+
+    # The dataset scanned the training masks; hand the model the per-class input-size caps it applies,
+    # so the checkpoint carries them and generation plans each class against the sizes it trained on.
+    # (PackingDataLoader -> RankPartitionedDataLoader -> InpaintingDataset, as exp_config wires them.)
+    dataset = dataloader_train.dataloader_list[0].dataset
+    model.class_ladders = dataset.class_input_size_ladders
+    # A resume restarts the dataloader workers; seeding them from the iteration it continues at gives
+    # them a stream the run has not drawn yet, not a replay of its first iterations. The checkpointer
+    # restores every other generator itself.
+    dataset.start_iteration = trainer.checkpointer.resume_iteration()
 
     trainer.train(model, dataloader_train, dataloader_val)
 

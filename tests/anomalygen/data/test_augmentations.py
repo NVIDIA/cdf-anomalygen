@@ -12,6 +12,7 @@ from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import functional as tF
 
+from anomalygen.configs.texture.constants import DEFAULT_INPUT_SIZE_LADDER
 from anomalygen.data.augmentations import (
     RandomHorizontalFlip,
     RandomInstanceDrop,
@@ -19,6 +20,7 @@ from anomalygen.data.augmentations import (
     RandomRatioCrop,
     RandomRingJitter,
     RandomRotation,
+    RandomScaleCrop,
     RandomVerticalFlip,
 )
 
@@ -32,6 +34,7 @@ from anomalygen.data.augmentations import (
         RandomHorizontalFlip,
         RandomOrthogonalRotation,
         RandomRotation,
+        RandomScaleCrop,
         RandomRatioCrop,
     ],
 )
@@ -52,29 +55,23 @@ def _asymmetric_image():
     return Image.fromarray(arr, mode="RGB")
 
 
-def _mask_with_square(size=64, lo=20, hi=40):
-    arr = np.zeros((size, size), dtype=np.uint8)
-    arr[lo:hi, lo:hi] = 255
-    return Image.fromarray(arr, mode="L")
-
-
-def test_horizontal_flip_applies_when_probability_certain():
+def test_horizontal_flip_applies_when_probability_certain(mask_with_square):
     img = _asymmetric_image()
-    out_img, _ = RandomHorizontalFlip(p=1.0, rng=np.random.default_rng(0))(img, _mask_with_square())
+    out_img, _ = RandomHorizontalFlip(p=1.0, rng=np.random.default_rng(0))(img, mask_with_square())
     # Top-left marker moves to top-right after an h-flip.
     assert np.array(out_img)[0, -1, 0] == 255
     assert np.array(out_img)[0, 0, 0] == 0
 
 
-def test_horizontal_flip_skipped_when_probability_zero():
+def test_horizontal_flip_skipped_when_probability_zero(mask_with_square):
     img = _asymmetric_image()
-    out_img, _ = RandomHorizontalFlip(p=0.0, rng=np.random.default_rng(0))(img, _mask_with_square())
+    out_img, _ = RandomHorizontalFlip(p=0.0, rng=np.random.default_rng(0))(img, mask_with_square())
     assert np.array_equal(np.array(out_img), np.array(img))
 
 
-def test_vertical_flip_applies_when_probability_certain():
+def test_vertical_flip_applies_when_probability_certain(mask_with_square):
     img = _asymmetric_image()
-    out_img, _ = RandomVerticalFlip(p=1.0, rng=np.random.default_rng(0))(img, _mask_with_square())
+    out_img, _ = RandomVerticalFlip(p=1.0, rng=np.random.default_rng(0))(img, mask_with_square())
     # Top-left marker moves to bottom-left after a v-flip.
     assert np.array(out_img)[-1, 0, 0] == 255
 
@@ -117,11 +114,11 @@ def test_random_rotation_preserves_thin_mask_area():
     assert int((bilinear >= 128).sum()) < area
 
 
-def test_flip_stack_preserves_size_and_mask_binary():
-    """The flips are standalone transforms now — composing them is the caller's job."""
+def test_flip_stack_preserves_size_and_mask_binary(mask_with_square):
+    """The flips are standalone transforms; composing them is the caller's job."""
     rng = np.random.default_rng(1)
     img = Image.fromarray(np.full((64, 64, 3), 120, np.uint8), mode="RGB")
-    mask = _mask_with_square()
+    mask = mask_with_square()
     out_img, out_mask = img, mask
     for aug in (
         RandomVerticalFlip(0.5, rng=rng),
@@ -134,54 +131,112 @@ def test_flip_stack_preserves_size_and_mask_binary():
     assert set(np.unique(np.array(out_mask))).issubset({0, 255})
 
 
-def test_random_ratio_crop_requires_l_mode_mask():
+# --- RandomScaleCrop -----------------------------------------------------------------------------
+
+
+def test_random_scale_crop_requires_l_mode_mask():
     img = _asymmetric_image()
     with pytest.raises(ValueError):
-        RandomRatioCrop(rng=np.random.default_rng(0))(img, img.convert("RGB"))
+        RandomScaleCrop(rng=np.random.default_rng(0))(img, img.convert("RGB"))
 
 
-def test_random_ratio_crop_empty_mask_returns_unchanged():
-    rng = np.random.default_rng(2)
+def test_random_scale_crop_rejects_a_nonpositive_scale_low():
+    # The recipe validator checks the band, but a direct construction bypasses it; log(0) is -inf and
+    # every draw would then be 0 with no error.
+    with pytest.raises(ValueError, match="scale_range low must be > 0"):
+        RandomScaleCrop(scale_range=(0.0, 2.0), rng=np.random.default_rng(0))
+
+
+def test_random_scale_crop_rejects_an_empty_mask():
+    # The dataset drops empty masks at scan time, so one reaching the crop was emptied by an earlier
+    # stage; passing it through untouched would train a native-size sample with a zero defect loss.
     img = Image.fromarray(np.zeros((100, 100, 3), np.uint8), mode="RGB")
     empty_mask = Image.fromarray(np.zeros((100, 100), np.uint8), mode="L")
-    out_img, out_mask = RandomRatioCrop(rng=rng)(img, empty_mask)
-    # No foreground to centre on -> the pair is returned uncropped; sizes stay full.
-    assert out_img.size == (100, 100)
-    assert out_mask.size == (100, 100)
+    with pytest.raises(ValueError, match="no defect pixels"):
+        RandomScaleCrop(rng=np.random.default_rng(2))(img, empty_mask)
 
 
-def test_random_ratio_crop_produces_aligned_bounded_crop():
+def test_random_scale_crop_emits_the_pair_already_at_input_size(mask_with_square):
     rng = np.random.default_rng(3)
     img = Image.fromarray(np.full((100, 100, 3), 50, np.uint8), mode="RGB")
-    mask = _mask_with_square(size=100, lo=40, hi=60)
-    out_img, out_mask = RandomRatioCrop(final_crop_size=512, rng=rng)(img, mask)
-    # Image and mask are cropped with identical windows, so their sizes must match ...
-    assert out_img.size == out_mask.size
-    # ... and stay within the original frame.
-    w, h = out_img.size
-    assert 0 < w <= 100 and 0 < h <= 100
-    # Square, matching inference's crop_grid_by_ratio window: a random train-time aspect would show
-    # the model framings generation never produces. NOTE this fixture is square (100x100) with a
-    # small defect, so the window always fits — see
-    # test_random_ratio_crop_clamps_to_a_rectangle_when_the_window_overflows for the case where it
-    # does not, which is the common one on real non-square data.
-    assert w == h
+    mask = mask_with_square(size=100, lo=40, hi=60)
+    crop = RandomScaleCrop(
+        crop_ratio_range=(1.5, 4.0), scale_range=(0.5, 4.0), input_size_ladder=(64, 128, 256), rng=rng
+    )
+    for _ in range(20):
+        out_img, out_mask = crop(img, mask)
+        # The dataset must not resize afterwards, so the transform owns the final size: image and
+        # mask come back identically sized, on ladder sizes, per axis.
+        assert out_img.size == out_mask.size
+        assert out_img.size[0] in (64, 128, 256) and out_img.size[1] in (64, 128, 256)
+        assert int((np.array(out_mask) > 0).sum()) > 0  # the defect is never cropped away
 
 
-def test_random_ratio_crop_clamps_to_a_rectangle_when_the_window_overflows():
-    """A window bigger than the frame comes back rectangular — matching inference, not a deviation.
+def test_random_scale_crop_input_may_be_rectangular_for_an_elongated_defect():
+    """Axes are planned independently, so an elongated defect gets an elongated input.
 
-    ``crop_paste.best_crop`` clamps each axis the same way, so this framing is one the model also
-    sees at generation time. Forcing a square here would make training disagree with inference.
+    Forcing a square here would squeeze the crop and distort the defect's aspect ratio.
     """
     rng = np.random.default_rng(0)
     img = Image.fromarray(np.zeros((400, 1600, 3), np.uint8), mode="RGB")  # wide frame
     m = np.zeros((400, 1600), np.uint8)
-    m[170:230, 770:830] = 255  # 60x60 defect -> side 60*8 = 480 > H
+    m[190:210, 400:1200] = 255  # 800x20 defect
     mask = Image.fromarray(m, mode="L")
 
-    crop = RandomRatioCrop(final_crop_size=512, ratio_range=(8.0, 8.0), rng=rng)
+    crop = RandomScaleCrop(
+        crop_ratio_range=(1.5, 1.5), scale_range=(1.0, 1.0), input_size_ladder=DEFAULT_INPUT_SIZE_LADDER, rng=rng
+    )
     w, h = crop(img, mask)[0].size
+    assert w > h, "the wide defect must get a wide input, not a square"
 
-    assert h == 400, "height should clamp to the frame"
-    assert w > h, "width does not clamp, so the crop is rectangular"
+
+def test_random_ratio_crop_pins_one_input_size_on_a_single_entry_ladder(mask_with_square):
+    # How a recipe asks for a fixed model input size: every sample, at any drawn framing, comes back
+    # on exactly that size — which is what makes the batch shape constant.
+    rng = np.random.default_rng(5)
+    img = Image.fromarray(np.full((300, 300, 3), 50, np.uint8), mode="RGB")
+    mask = mask_with_square(size=300, lo=100, hi=140)
+    crop = RandomRatioCrop(crop_ratio_range=(1.5, 8.0), input_size_ladder=(128,), rng=rng)
+
+    for _ in range(20):
+        out_img, out_mask = crop(img, mask)
+        assert out_img.size == out_mask.size == (128, 128)
+        assert int((np.array(out_mask) > 0).sum()) > 0  # the defect is never cropped away
+
+
+def test_random_ratio_crop_frames_off_the_bbox_not_the_pixel_size(mask_with_square):
+    # The distinguishing property of "ratio" mode: at a pinned ratio, defects of very different
+    # pixel sizes fill the same fraction of the input. Under "scale" mode they would not.
+    img = Image.fromarray(np.full((1000, 1000, 3), 50, np.uint8), mode="RGB")
+    fractions = []
+    for side in (20, 200):
+        mask = mask_with_square(size=1000, lo=400, hi=400 + side)
+        crop = RandomRatioCrop(crop_ratio_range=(4.0, 4.0), input_size_ladder=(256,), rng=np.random.default_rng(0))
+        out_mask = crop(img, mask)[1]
+        fractions.append(int((np.array(out_mask) > 0).sum()) / (256 * 256))
+    assert fractions[0] == pytest.approx(fractions[1], rel=0.1)
+
+
+def test_the_shared_scale_keeps_a_square_defect_square(mask_with_square):
+    # One scale for both axes, so a square defect renders square whatever the draw. The single-size
+    # ladder keeps the stochastic size snap out of it.
+    img = Image.fromarray(np.zeros((2000, 2000, 3), np.uint8), mode="RGB")
+    mask = mask_with_square(size=2000, lo=800, hi=860)
+    crop = RandomScaleCrop(
+        crop_ratio_range=(1.5, 4.0), scale_range=(0.333, 3.0), input_size_ladder=(256,), rng=np.random.default_rng(0)
+    )
+    for _ in range(20):
+        arr = np.array(crop(img, mask)[1])
+        ys, xs = np.nonzero(arr >= 128)
+        assert (xs.max() - xs.min() + 1) / (ys.max() - ys.min() + 1) == pytest.approx(1.0, abs=0.1)
+
+
+def test_random_scale_crop_honours_a_per_class_ladder_override(mask_with_square):
+    # The per-class input-size cap is applied by passing a truncated ladder for this sample only.
+    rng = np.random.default_rng(4)
+    img = Image.fromarray(np.full((512, 512, 3), 50, np.uint8), mode="RGB")
+    mask = mask_with_square(size=512, lo=200, hi=260)
+    crop = RandomScaleCrop(scale_range=(1.0, 4.0), input_size_ladder=(64, 128, 256, 512), rng=rng)
+    for _ in range(20):
+        out_img, _ = crop(img, mask, ladder=(64, 128))
+        assert max(out_img.size) <= 128

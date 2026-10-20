@@ -20,7 +20,7 @@ import numpy as np
 from cosmos_framework.utils import log
 from PIL import Image
 
-from anomalygen.data.utils import list_image_mask_pairs, validate_anomaly_type
+from anomalygen.data.utils import list_image_mask_pairs, require_same_size, validate_anomaly_type
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg")
 RECON_SUBDIR = "reconstructed_image"
@@ -85,8 +85,8 @@ def load_generated(
 ) -> Dict[str, Dict[str, List]]:
     """Generated images/masks keyed by anomaly type, read straight from the SDG output tree.
 
-    ``target_size`` (e.g. the recipe's ``model_input_size``) resizes each image/mask to a square of
-    that side; ``None`` keeps native resolution.
+    ``target_size`` resizes each image/mask to a square of that side; ``None`` keeps native
+    resolution, which is what compares variable-size outputs as they were generated.
 
     ``with_original_image`` additionally loads the pre-edit clean image from ``original_image/`` into
     an ``"original_image"`` list. Correspondence (NN/MNN) does not need it, but the anomaly-quality
@@ -116,8 +116,7 @@ def load_generated(
                 continue
             img = Image.open(os.path.join(recon_dir, f))
             mask = Image.open(mask_path)
-            if mask.size != img.size:
-                raise ValueError(f"mask/image size mismatch: {mask_path} {mask.size} vs {img.size}")
+            require_same_size(img, mask, f"{os.path.join(recon_dir, f)} + {mask_path}")
             recon.append(_img_to_float(img, target_size))
             masks.append(_mask_to_float(mask, target_size))
             paths.append(os.path.join(recon_dir, f))
@@ -154,8 +153,7 @@ def load_real(
                 continue
             img = Image.open(img_path)
             mask = Image.open(mask_path)
-            if mask.size != img.size:
-                raise ValueError(f"mask/image size mismatch: {mask_path} {mask.size} vs {img.size}")
+            require_same_size(img, mask, f"{img_path} + {mask_path}")
             imgs.append(_img_to_float(img, target_size))
             masks.append(_mask_to_float(mask, target_size))
         if not imgs:

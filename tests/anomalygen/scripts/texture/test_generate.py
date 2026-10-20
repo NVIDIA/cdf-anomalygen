@@ -16,6 +16,7 @@ from anomalygen.scripts.texture.generate import (
     _build_sample_output_plans,
     _get_rank_work_items,
     _merge_rank_rows,
+    gather_from_ranks,
 )
 
 
@@ -47,7 +48,7 @@ def test_blocked_rows_merge_single_rank_and_write_guardrail_csv(tmp_path):
         blocked_row(1, 0, "Phone+oil", "a.png", "a_mask.png", "image", "blocked a out0"),
         blocked_row(2, -1, "Phone+scratch", "b.png", "b_mask.png", "text", "blocked b"),
     ]
-    merged = _merge_rank_rows(rows, world_size=1)
+    merged = _merge_rank_rows(gather_from_ranks(rows, world_size=1))
 
     assert [(r["index"], r["output_idx"]) for r in merged] == [(1, 0), (1, 1), (2, -1)]
     assert set(merged[0]) == set(BLOCKED_CSV_HEADER)
@@ -62,3 +63,16 @@ def test_blocked_rows_merge_single_rank_and_write_guardrail_csv(tmp_path):
         read_back = list(csv.DictReader(f))
     assert [(r["index"], r["output_idx"]) for r in read_back] == [("1", "0"), ("1", "1"), ("2", "-1")]
     assert read_back[0]["message"] == "blocked a out0"
+
+
+def test_importing_the_module_does_not_disable_autograd():
+    """``init_script`` turns autograd off process-wide, so it is guarded behind ``__main__``.
+    Unguarded, importing any pipeline script would silently kill gradients for the whole process."""
+    import importlib
+
+    import torch
+
+    torch.set_grad_enabled(True)
+    for name in ("generate", "evaluate", "filter"):
+        importlib.reload(importlib.import_module(f"anomalygen.scripts.texture.{name}"))
+        assert torch.is_grad_enabled(), f"importing {name}.py disabled autograd"

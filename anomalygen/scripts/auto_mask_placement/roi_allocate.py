@@ -37,21 +37,25 @@ Usage::
 
 import argparse
 import json
-import math
 import pathlib
 
 from cosmos_framework.utils import log
+from PIL import Image
 
-from anomalygen.data.utils import validate_anomaly_type
+from anomalygen import allocation
+from anomalygen.auto_mask_placement.tht2roi import THT_CLASSES
+from anomalygen.data.utils import list_images, validate_anomaly_type
 
-_IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp"}
+# Both routes are fed by <TEXTURE>/cad_mask/<clean_stem>.png plus the root label file; they differ
+# only in how the parsed classes are turned into regions.
+_CAD_LIKE = frozenset({"cad", "cad_tht"})
 
+# The classes cad_tht reads as regions B and C.
+_THT_REQUIRED_CLASSES = frozenset({"pad", "hole"})
 
-def _list_images(d):
-    d = pathlib.Path(d)
-    if not d.is_dir():
-        return []
-    return [p for p in d.iterdir() if p.suffix.lower() in _IMG_EXTS]
+# D is the lead face, which newer annotations name pin_tip and older ones name pin. Either
+# satisfies the requirement -- demanding both would reject the very data this route is for.
+_THT_LEAD_CLASSES = frozenset({"pin_tip", "pin"})
 
 
 def _validate_amp_inputs(dataset_dir, defect_desc):
@@ -62,17 +66,36 @@ def _validate_amp_inputs(dataset_dir, defect_desc):
       * <dataset_dir>/<TEXTURE>/clean_image/ or <dataset_dir>/<TEXTURE>/ has >=1 image
         (flat <dataset_dir>/ as the final fallback)
       * spatial_dependency=="text": roi_prompt_defect_location present and non-empty
-      * spatial_dependency=="cad": semantic_segmentation_labels.json exists,
+      * spatial_dependency in ("cad", "cad_tht"): semantic_segmentation_labels.json exists,
         <TEXTURE>/cad_mask/ exists, and a cad_mask/<stem>.png exists per clean image
+      * spatial_dependency=="cad_tht": the label file declares the THT classes, and the
+        defect names are in the published THT enum
     """
     dataset_dir = pathlib.Path(dataset_dir)
     entries = [json.loads(line) for line in pathlib.Path(defect_desc).read_text().splitlines() if line.strip()]
 
     errors = []
-    if any(e.get("spatial_dependency") == "cad" for e in entries):
+    if any(e.get("spatial_dependency") in _CAD_LIKE for e in entries):
         labels = dataset_dir / "semantic_segmentation_labels.json"
         if not labels.exists():
-            errors.append(f"missing {labels} (required for spatial_dependency=cad)")
+            errors.append(f"missing {labels} (required for spatial_dependency={'/'.join(sorted(_CAD_LIKE))})")
+        elif any(e.get("spatial_dependency") == "cad_tht" for e in entries):
+            # A cad_tht run against a `cad` label file (pad/capacitor/ic/solder) parses cleanly and
+            # yields zero joints, so every row would be dropped warn-only with nothing to point at.
+            # Check the palette here, where the failure can still name what is missing.
+            try:
+                declared = {info["class"] for info in json.loads(labels.read_text()).values()}
+            except (ValueError, KeyError, TypeError) as exc:
+                errors.append(f"{labels}: unreadable label file ({exc})")
+            else:
+                missing = sorted(_THT_REQUIRED_CLASSES - declared)
+                if not declared & _THT_LEAD_CLASSES:
+                    missing.append(" or ".join(sorted(_THT_LEAD_CLASSES)))
+                if missing:
+                    errors.append(
+                        f"{labels}: spatial_dependency=cad_tht needs the class(es) {missing}; "
+                        f"the file declares {sorted(declared)}"
+                    )
 
     for e in entries:
         full = e["defect_type"]
@@ -98,7 +121,7 @@ def _validate_amp_inputs(dataset_dir, defect_desc):
             clean_pool = clean_tex
         else:
             clean_pool = dataset_dir
-        clean_imgs = _list_images(clean_pool)
+        clean_imgs = list_images(clean_pool)
         if not clean_imgs:
             errors.append(f"{full}: no clean images under {clean_pool}")
 
@@ -106,7 +129,7 @@ def _validate_amp_inputs(dataset_dir, defect_desc):
             prompt = (e.get("roi_prompt_defect_location") or "").strip()
             if not prompt:
                 errors.append(f"{full}: spatial_dependency={sd} requires non-empty roi_prompt_defect_location")
-        elif sd == "cad":
+        elif sd in _CAD_LIKE:
             cad_dir = dataset_dir / texture / "cad_mask"
             if not cad_dir.is_dir():
                 errors.append(f"{full}: missing {cad_dir}")
@@ -116,6 +139,30 @@ def _validate_amp_inputs(dataset_dir, defect_desc):
                 errors.append(
                     f"{full}: {len(missing_cad)} clean image(s) without matching cad_mask (first: {missing_cad[0]}.png)"
                 )
+            # The enum is a module constant, not a spec field, so a typo is caught here rather than
+            # silently selecting no ROI rule at placement time.
+            if sd == "cad_tht" and anomaly not in THT_CLASSES:
+                errors.append(
+                    f"{full}: unknown cad_tht defect {anomaly!r}; supported: {', '.join(sorted(THT_CLASSES))}"
+                )
+            # cad_tht builds the ROI, the AMP canvas and the placed mask at the cad_mask's resolution,
+            # so a clean image of a different size would be resampled against that mask downstream.
+            # Checked here because it is a property of the dataset, not of one run. Deliberately not
+            # applied to `cad`, whose set of accepted inputs must not change.
+            if sd == "cad_tht":
+                mismatched = []
+                for clean in clean_imgs:
+                    cad_path = cad_dir / f"{clean.stem}.png"
+                    if not cad_path.exists():
+                        continue
+                    with Image.open(clean) as ci, Image.open(cad_path) as cm:
+                        if ci.size != cm.size:
+                            mismatched.append(f"{clean.stem} (clean {ci.size} vs cad_mask {cm.size})")
+                if mismatched:
+                    errors.append(
+                        f"{full}: {len(mismatched)} clean image(s) whose cad_mask is a different size "
+                        f"(first: {mismatched[0]})"
+                    )
         elif sd in (None, "free"):
             pass
         else:
@@ -142,33 +189,26 @@ def _count_masks(dataset_dir, defect_types):
     for full_type in defect_types:
         texture, anomaly = full_type.split("+", 1)
         d = pathlib.Path(dataset_dir) / texture / "mask" / anomaly
-        counts[full_type] = len(_list_images(d))
+        counts[full_type] = len(list_images(d))
     return counts
 
 
 def _uniform(num_sdg, defect_types):
-    """Uniform allocation: base each, first (num_sdg % N) defects get +1."""
-    n = len(defect_types)
-    base = num_sdg // n
-    remainder = num_sdg % n
-    alloc = {t: base for t in defect_types}
-    for t in defect_types[:remainder]:
-        alloc[t] += 1
-    return alloc
+    """Uniform allocation: base each, first (num_sdg % N) defects get +1.
+
+    The rule itself lives in ``anomalygen.allocation`` because the AMG backend answers the same
+    ``num_sdg`` request and has to answer it identically; this stays as the name AMP's own callers use.
+    """
+    return allocation.uniform(num_sdg, defect_types)
 
 
 def _proportional(num_sdg, defect_types, counts):
-    """Proportional to mask counts via largest-remainder rounding."""
-    total = float(sum(counts.get(t, 0) for t in defect_types))
-    if total <= 0:
-        raise ValueError(f"sum of mask counts must be > 0 (got {counts})")
-    raw = {t: num_sdg * counts.get(t, 0) / total for t in defect_types}
-    floors = {t: int(math.floor(r)) for t, r in raw.items()}
-    remainder = num_sdg - sum(floors.values())
-    order = sorted(defect_types, key=lambda t: raw[t] - floors[t], reverse=True)
-    for t in order[:remainder]:
-        floors[t] += 1
-    return floors
+    """Proportional to mask counts via largest-remainder rounding.
+
+    Delegates for the reason ``_uniform`` does: AMG answers the same ``num_sdg`` request and has to
+    answer it identically. This stays as the name AMP's own callers and tests use.
+    """
+    return allocation.proportional(num_sdg, defect_types, counts)
 
 
 def _allocate(num_sdg, defect_types, counts, *, mode="inference", override=None):
@@ -176,55 +216,27 @@ def _allocate(num_sdg, defect_types, counts, *, mode="inference", override=None)
 
     mode:
         - "inference": uniform; no per-defect floor.
-        - "validation": proportional to mask counts; enforces ≥1 per defect.
+        - "validation": proportional to mask counts; enforces >=1 per defect.
 
     override:
         Dict of {defect_type: count}. Only valid with mode="inference". Defect
         types not listed get 0. If sum(override) != num_sdg, a warning is logged
         and the override sum is used as the effective num_sdg.
+
+    The policy itself lives in ``anomalygen.allocation`` so both mask backends share it; this passes
+    AMP's logger in, since that module deliberately carries no logging dependency.
     """
-    if mode not in ("inference", "validation"):
-        raise ValueError(f"unknown --mode {mode!r} (expected 'inference' or 'validation')")
-    if num_sdg < 0:
-        raise ValueError(f"num_sdg must be >= 0 (got {num_sdg})")
-    if not defect_types:
-        raise ValueError("defect_types must be non-empty")
-
-    if override is not None:
-        if mode != "inference":
-            raise ValueError(f"--per_defect_counts is only valid with --mode inference (got --mode {mode})")
-        unknown = [k for k in override if k not in defect_types]
-        if unknown:
-            log.warning(
-                f"--per_defect_counts has unknown defect type(s) {unknown} not in {list(defect_types)}; ignored"
-            )
-        alloc = {t: int(override.get(t, 0)) for t in defect_types}
-        override_sum = sum(alloc.values())
-        if override_sum != num_sdg:
-            log.warning(
-                f"--per_defect_counts sum ({override_sum}) differs from --num_sdg ({num_sdg}); "
-                "using override sum as effective num_sdg"
-            )
-        return alloc
-
-    if mode == "inference":
-        return _uniform(num_sdg, defect_types)
-
-    # mode == "validation"
-    alloc = _proportional(num_sdg, defect_types, counts)
-    # KPI floor: training validation needs per-defect samples for stable
-    # nn_score / mnn_score. Refuse to silently allocate 0.
-    zero_types = [t for t in defect_types if alloc[t] == 0]
-    if zero_types:
-        n_total = int(sum(counts.get(t, 0) for t in defect_types))
-        positive = [counts.get(t, 0) for t in defect_types if counts.get(t, 0) > 0]
-        n_min = min(positive) if positive else 0
-        suggested = max(num_sdg, math.ceil(3 * n_total / n_min)) if n_min > 0 else num_sdg
-        raise ValueError(
-            f"validation JSONL coverage broken: types {zero_types} got 0 entries with num_sdg={num_sdg}. "
-            f"Increase num_sdg to >= {suggested} or trim defect_spec."
-        )
-    return alloc
+    return allocation.allocate(
+        num_sdg,
+        defect_types,
+        counts,
+        mode=mode,
+        override=override,
+        warn=log.warning,
+        total_label="num_sdg",
+        mode_label="--mode",
+        override_label="--per_defect_counts",
+    )
 
 
 def main(argv=None):

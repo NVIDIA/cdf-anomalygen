@@ -160,7 +160,7 @@ def test_recipe_wires_best_metric_from_early_stop_metric(tmp_path):
     exp = build_anomalygen_texture_ft_experiment(
         dataset_name="t",
         dataset_path=str(tmp_path),
-        anomaly_types=["t+a"],
+        anomaly_types=[["t", "a"]],
         testcase_jsonl=str(tmp_path / "testcase.jsonl"),
         early_stop_metric="fid",
     )

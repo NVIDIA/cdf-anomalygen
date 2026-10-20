@@ -47,7 +47,7 @@ def visualize(
     for class_name, bbox, mask in zip(classes, bboxes, instance_masks):
         # Mask.
         mask_array = np.array(mask)
-        color = np.array([30 / 255, 144 / 255, 255 / 255, mask_alpha])
+        color = np.array([30 / 255, 144 / 255, 1.0, mask_alpha])
         mask_array = np.expand_dims(mask_array, axis=-1) * color.reshape(1, 1, -1)
         mask = Image.fromarray((mask_array).astype(np.uint8), mode="RGBA")
         alpha_channel = mask.split()[-1]

@@ -105,7 +105,7 @@ class BackboneBase(nn.Module, metaclass=BackboneMeta):
             freeze_norm (bool): If `True`, all normalization layers in the backbone will be frozen. Default: `False`.
         """
         if not self._module_is_initialized:
-            nn.Module.__init__(self)
+            super().__init__()
 
         freeze_at = freeze_at or []
         if isinstance(freeze_at, str):

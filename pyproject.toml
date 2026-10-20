@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [project]
-name = "paidf-anomalygen"
-version = "1.1.0"
-description = "Physical AI Data Factory (PAIDF) AnomalyGen: a pipeline for generating synthetic defect data by fine-tuning Cosmos3 into anomaly-inpainting models (mask placement, fine-tuning, SDG, evaluation, quality refinement, pseudo-labeling)"
+name = "cdf-anomalygen"
+version = "1.2.0"
+description = "Cosmos Data Factory (CDF) AnomalyGen: a pipeline for generating synthetic defect data by fine-tuning Cosmos3 into anomaly-inpainting models (mask placement, fine-tuning, SDG, evaluation, quality refinement, pseudo-labeling)"
 requires-python = ">=3.13"
 license = { text = "Apache-2.0" }
 authors = [{ name = "NVIDIA Corporation" }]

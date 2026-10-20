@@ -29,7 +29,7 @@ def binary_mask_to_rle(binary_mask: np.ndarray) -> Dict[str, Any]:
     rle = {"counts": [], "size": list(binary_mask.shape)}
     flattened_mask = binary_mask.ravel(order="F")
     diff_arr = np.diff(flattened_mask)
-    nonzero_indices = np.where(diff_arr != 0)[0] + 1
+    nonzero_indices = np.nonzero(diff_arr != 0)[0] + 1
     lengths = np.diff(np.concatenate(([0], nonzero_indices, [len(flattened_mask)])))
     # Note that the odd counts are always the numbers of zeros.
     if flattened_mask[0] == 1:

@@ -1,0 +1,178 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example config for `python -m anomalygen.scripts.run_pipeline --config <this>`.
+#
+# Only `input`, `output` and `recipe` are always required; `checkpoint` is required for the
+# generate and refine stages, and `num_sdg` for the amp stage. Everything else has a default,
+# and every key is listed here with the default it takes when omitted.
+
+# ── required ──────────────────────────────────────────────────────────────────
+input:  datasets/tht_e2e                          # dataset root, in the Step 1 layout
+output: results/tht_run                           # every stage writes under here
+recipe: ag_config/exp_texture_ft_phone_screen.yaml
+checkpoint: results/.../iter_000015000.pt         # fine-tuned checkpoint (generate, refine)
+
+# ── what to generate ──────────────────────────────────────────────────────────
+num_sdg: 40           # total images (amp); may be omitted when per_defect_counts is given,
+                      # which states the total itself (a mismatch is warned about up front)
+
+# Which defect types to generate, and how many of each. Omit it to generate every type in
+# defect_spec.jsonl, allocated by mode below. This is roi_allocate's own model: a type absent
+# from the mapping is allocated zero, which is how a subset is selected.
+# Requires mode: inference -- a validation set is allocated proportionally over every type.
+per_defect_counts: {SolderPin+bridge: 40}
+
+mode: inference       # inference (uniform) | validation (proportional, >=1 per defect)
+
+# on: every clean image used exactly once -- for datasets whose clean images are work items
+# (e.g. joint crops to composite back onto a board). Requires a single defect type, and
+# num_sdg should equal the clean-image count. off (default): round-robin, which maximises
+# (submask, clean) diversity but does not cover every clean image.
+amp_per_clean_pairing: on
+
+# ── sampling (omit to use the shared texture defaults) ────────────────────────
+guidance: 3.0
+num_steps: 35
+crop_ratio: 2.0
+
+# ── seeds ─────────────────────────────────────────────────────────────────────
+amp_seed: 42          # mask placement
+base_seed: 1          # diffusion noise -- a different roll of the dice, not a different placement
+
+# THE TWO SEEDS ARE DIFFERENT AXES
+#   amp_seed   picks WHICH base mask and how it is placed  -> changes the defect's shape/position
+#   base_seed  the diffusion noise under that mask         -> changes only how it is rendered
+# Changing base_seed alone re-renders the identical mask. Changing amp_seed alone moves the defect but
+# keeps the noise. A caller that wants "a genuinely different image" has to vary BOTH.
+#
+# VARY BOTH PER TASK WHEN EACH RUN PRODUCES ONE IMAGE
+# Holding them fixed is right for a batch and wrong for a fan-out, and the difference is silent.
+#
+# roi_pair shuffles the submask bank with random.Random(f"{amp_seed}:{defect_type}") -- a key holding
+# only those two things, not the clean image and not which run this is -- and record i then takes
+# submask_idx = i % S. A run that emits ONE image only ever has record i=0, so it always takes
+# submask 0 of that one shuffle. `index` is 0 too, so the noise seed collapses to base_seed. Trigger
+# such a run twice at one config and you get the same mask, the same placement and the same render;
+# point 200 of them at 200 joints and all 200 share one base mask, with only the ROI differing. Each
+# image is plausible on its own -- the repetition only shows up in a contact sheet.
+#
+# A batch does not have this problem: 20 records walk submask_idx 0..19 and index 0..19.
+#
+# So derive both from whatever identifies the task -- the work item, the trigger, or both:
+#
+#     n = zlib.crc32(f"{run_id}:{joint_id}".encode()) % 2**31
+#     amp_seed, base_seed = n, n ^ 0x5bf03635  # any two distinct values will do
+#
+# Keying on the work item alone makes joints differ but a re-trigger repeat; adding the trigger id
+# makes a re-trigger differ too, while a retry of the SAME trigger still reproduces. Nothing in the
+# entrypoint does this for you: identical config means identical output, deliberately.
+#
+# This buys a CHANCE of a different mask, not a guarantee -- the draw is uniform over the bank, so
+# it collides.
+
+# ── execution ─────────────────────────────────────────────────────────────────
+num_gpus: 1
+num_search_run: 3     # quality-refinement rounds
+guardrail: true       # false disables the content filter; blocked images produce no output
+base_checkpoint: null # null -> generate.py picks it from the recipe's model_size
+
+# ── output naming ─────────────────────────────────────────────────────────────
+# source (default): export/<clean_stem>.png, so results keep the identity of the crop they came
+#   from. Errors if two outputs claim one source name.
+# indexed: keep generate.py's <anomaly_type>_<nnnnn>.png.
+# Under amg: source needs one output per clean; amg reuses a clean once num_sdg exceeds the clean
+# count, so indexed is the safe default under amg (see example_amg.yaml).
+output_naming: source
+
+# ── mask backend: amg (read only when `stages` includes amg) ─────────────────
+# amp and amg are two backends for one artifact, <output>/{amp,amg}/testcase.jsonl. Pick ONE by
+# listing it in `stages`; listing both is an error. amg needs a vision-language model reachable
+# over an OpenAI-compatible endpoint; WHERE it serves and its key live in the registry file, not
+# here, so this config never carries a secret and the URL can be filled in per run.
+amg_gen_model: null        # registry name of the model that proposes / refines; required under amg
+amg_judge_model: null      # registry name of the model that scores; required under amg
+amg_model_registry: null   # the amg CLI's --model-registry file, a YAML list of
+                           # {model, base_url, key}; e.g. scripts/agentic_mask_generation_serving/endpoints.yaml
+amg_serve: null            # a serving recipe under scripts/agentic_mask_generation_serving/, e.g.
+                           # gemma-4-31b-it: run_pipeline starts that server before amg, waits for it
+                           # and stops it after. Then amg_gen_model / amg_judge_model default to the
+                           # recipe's model and amg_model_registry may be omitted. null -> the
+                           # registry must name an endpoint that is already serving.
+amg_cache_dir: null        # null -> <output>/amg_cache; point every run of one dataset at a shared
+                           # dir to reuse the distilled defect library
+# A small local model needs the in-loop beam and the three information channels; a strong cloud
+# model does not. Off by default so a cloud run's prompts stay byte-identical to the CLI's.
+# The shipped Gemma recipe turns all five on (see example_amg.yaml).
+amg_beam_multi: 0                  # 0 = off
+amg_beam_pairwise: false
+amg_exemplar_captions: false
+amg_exemplar_visual_prompt: false
+amg_coverage_note: false
+
+# Under amg: guidance / num_steps / crop_ratio above are written into every testcase row after the
+# stage runs, so generate sees the same rows either backend produces. `amp_seed` has no effect (the
+# model decides placement) and `amp_per_clean_pairing: on` is an error (amg has no pairing step).
+
+# ── object storage ────────────────────────────────────────────────────────────
+# Sources and sinks for the staging stages. Omit it entirely to keep everything local -- `publish`
+# is not in the default stage list, so a config that says nothing here uploads nothing.
+#
+# NEVER PUT A CREDENTIAL IN THIS FILE. The resolved config is written to
+# <output>/pipeline_config.resolved.yaml, and every stage's argv is logged, so a secret here reaches
+# both. Credentials are read from the environment only:
+#   msc://profile/...   MULTISTORAGECLIENT_CONFIGURATION (inline JSON) or MSC_CONFIG (a path)
+#   s3://bucket/...     the usual AWS chain -- AWS_ACCESS_KEY_ID / ... , or an instance role
+#
+# `fetch` keys are THIS FILE'S OWN KEYS, and each downloads to whatever that key already points at,
+# so no path is written twice. A URL naming an object copies that object; one naming a prefix copies
+# everything under it, keeping the tree below the prefix.
+#
+# A list is an OVERLAY, applied in order with the later source winning. That is what splits a dataset
+# by lifetime: the parts many runs share (the submask bank, defect_spec.jsonl) come from one prefix,
+# the part this run was handed comes from another, and they are merged into one directory here rather
+# than by the caller.
+#
+# A source may also be a LOCAL directory, for a caller that mounts the work item instead of uploading
+# it. It must be its own directory and not the destination: the merge replaces the destination
+# wholesale, so anything pre-placed there is deleted before the first stage reads it.
+#
+# `usecase://<name>` is a source too, and it is not downloaded but PREPARED: it runs one of the
+# dataset scripts this image ships under anomalygen/scripts/datasets/, which fetches from wherever
+# that dataset actually lives and writes the Step 1 layout. A name, never a path -- what is runnable
+# is decided by the image, not by a config that arrives from an orchestrator. `?p=<source>` hands
+# the script a file it cannot download itself (the phone-screen images are a manual Roboflow
+# export); a bare `?flag` is passed through as `--flag`. See example_usecase.yaml.
+#
+# `input_override` replaces individual paths INSIDE the fetched `input` -- it is the one key here
+# that is not a config key, because it names paths in a tree rather than a destination. It REPLACES
+# what it names rather than merging, which is what "generate from THESE boards, not the dataset's"
+# requires; a key naming a file keeps the dataset's own stem, and with it the cad_mask pairing.
+# Both are documented in full in docs/pipeline/config.md.
+#
+# publish uploads what <output>/export/export_manifest.json lists, plus the manifest itself. Not a
+# glob: export/ is never cleared, so a glob would ship a previous run's images too.
+staging:
+  fetch:
+    input:                                    # merged in order, later wins
+      - s3://my-bucket/anomalygen/assets/     #   shared: submask bank + defect_spec.jsonl
+      - s3://my-bucket/anomalygen/work/item/  #   per run: the clean image and its cad_mask
+      # - /mnt/work/item                      #   ... or mounted rather than uploaded
+      # - usecase://pcb                       #   ... or prepared by a script this image ships
+    recipe:     s3://my-bucket/anomalygen/assets/recipe.yaml
+    checkpoint: s3://my-bucket/anomalygen/checkpoints/model.pt
+    # input_override:                                  # paths inside `input`, each REPLACED
+    #   passive_component/clean_image/C225@1.jpg:       #   one file, keeping the dataset's stem
+    #     - s3://my-bucket/anomalygen/boards/C225.jpg
+    #   passive_component/cad_mask:                     #   or a whole directory
+    #     - s3://my-bucket/anomalygen/cad_mask/
+  publish:
+    output: s3://my-bucket/anomalygen/results/
+
+# ── stages ────────────────────────────────────────────────────────────────────
+# Any subset, in any order (they always run
+# prepare -> amp|amg -> generate -> evaluate -> refine -> export -> publish).
+# Exactly one of amp / amg. A skipped stage's artifacts must already exist under `output`, which is
+# how a run resumes. Every stage but amg is listed here; swap amp for amg to use the agentic backend
+# (see example_amg.yaml).
+stages: [prepare, amp, generate, evaluate, refine, export, publish]

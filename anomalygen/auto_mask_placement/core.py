@@ -117,9 +117,9 @@ class AutoMaskPlacement:
 
         # Log what's disabled
         disabled = ["shifting"]
-        if flip_x_prob == 0.0 and original_params.flip_x_probability > 0.0:
+        if flip_x_prob <= 0.0 and original_params.flip_x_probability > 0.0:
             disabled.append("X-flipping")
-        if flip_y_prob == 0.0 and original_params.flip_y_probability > 0.0:
+        if flip_y_prob <= 0.0 and original_params.flip_y_probability > 0.0:
             disabled.append("Y-flipping")
 
         log.info(
@@ -452,7 +452,7 @@ class AutoMaskPlacement:
 
     def _get_roi_dimensions(self, roi_mask: np.ndarray) -> Tuple[int, int]:
         """Get ROI width and height from mask"""
-        y_coords, x_coords = np.where(roi_mask > 127)
+        y_coords, x_coords = np.nonzero(roi_mask > 127)
         if len(x_coords) == 0 or len(y_coords) == 0:
             return roi_mask.shape[1], roi_mask.shape[0]
 
@@ -539,7 +539,7 @@ class AutoMaskPlacement:
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(vis_image, contours, -1, (0, 255, 0), 2)
 
-            y_coords, x_coords = np.where(mask > 127)
+            y_coords, x_coords = np.nonzero(mask > 127)
             if len(x_coords) > 0 and len(y_coords) > 0:
                 cx = int(np.mean(x_coords))
                 cy = int(np.mean(y_coords))

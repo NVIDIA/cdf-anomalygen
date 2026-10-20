@@ -9,3 +9,5 @@ a5e3edd742b8f1fcf27a3eb3878c67dfcb0e6881588fa35deef503d640ea69d1  nvidia/Cosmos3
 27881c65f10ab2a16d4b2bda2d6f52ddc8410b0980837fc96914e72a7d190b9b  nvidia/C-RADIO-V3/model.safetensors
 20eb789667fa5e60e7516bf509512f6cb61f01b0aa0695eadaea930c13892b36  wan2pt2/Wan2.2_VAE.pth
 2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318  facebook/sam2.1-hiera-large/sam2.1_hiera_large.pt
+eeef8791537bc04f110967c513149e037d2a9ae97d49add7291ebfa62806bbfa  hf/models--google--gemma-4-31b-it/snapshots/842da3794eaa0b77d5f08bae87a17459d91ff475/model-00001-of-00002.safetensors
+018912220f559f7025d60333e0996183cd538aa77ad6f4988a89ce47be681f10  hf/models--google--gemma-4-31b-it/snapshots/842da3794eaa0b77d5f08bae87a17459d91ff475/model-00002-of-00002.safetensors

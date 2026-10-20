@@ -7,7 +7,8 @@
 # as the template for a new dataset. Copy it and edit EVERY key in the dataset block —
 # ``dataset_name``, ``anomaly_types``, ``dataset_path``, ``testcase_jsonl``. They hold real phone_screen
 # values, not placeholders, so one left behind points training at the wrong data rather than erroring
-# out. Each ``[texture, defect]`` pair needs a matching ``{dataset_path}/{texture}/{defect}/`` directory.
+# out. Each ``[texture, defect]`` pair needs matching ``{dataset_path}/{texture}/anomaly_image/{defect}/`` and
+# ``{dataset_path}/{texture}/mask/{defect}/`` directories.
 #
 # Every key below the dataset block is OPTIONAL: deleting one falls back to the builder default in
 # ``anomalygen/configs/texture/exp_config.py``, and every value here IS that default — this file is
@@ -47,15 +48,7 @@ betas: [0.9, 0.95]
 eps: 1.0e-06
 weight_decay: 0.0
 
-# --- data -------------------------------------------------------------------------------------
-image_size: [512, 512]
-batch_size: 4             # samples packed per training step
-num_workers: 4
-ratio_range: [1.5, 8.0]   # anomaly crop area ratio range
-
 # --- validation generation --------------------------------------------------------------------
-model_input_size: 512
-shift: 5.0
 validation_batch_size: 16
 
 # --- early stopping ---------------------------------------------------------------------------

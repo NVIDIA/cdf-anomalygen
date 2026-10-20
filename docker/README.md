@@ -1,18 +1,18 @@
 # Docker
 
-Container build for **PAIDF AnomalyGen**. Reproduces `scripts/env_setup.sh`
-(py3.13, torch 2.12.1+cu132, CUDA 13.2) in an image.
+Container build for **CDF AnomalyGen**. Reproduces `scripts/env_setup.sh`
+(py3.13, torch 2.13.0+cu132, CUDA 13.2) in an image.
 
 > **You may not need to build at all** — *if* this repo's `VERSION` is already published on
-> [NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/paidf-anomalygen). Pulling needs
+> [NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cdf-anomalygen). Pulling needs
 > no registry login:
 >
 > ```shell
-> docker pull nvcr.io/nvidia/paidf-anomalygen:1.1.0
+> docker pull nvcr.io/nvidia/cdf-anomalygen:1.2.0
 > ```
 >
-> If that tag is not on the
-> [tag list](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/paidf-anomalygen/tags) yet,
+> If the pull fails (*manifest unknown*, *not found* or *pull access denied*) or that tag is
+> not on the [tag list](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cdf-anomalygen/tags) yet,
 > build from this checkout — an older tag was built from a different source revision and will
 > not match this tree. Also build when you want a modified image, a target NGC does not
 > publish, or an air-gapped bundle. **A source build takes > 1 h.**
@@ -47,9 +47,9 @@ installs the heavy wheels from stage 1, the pip requirements, cosmos-framework
   checkpoints **baked in** for offline runs. Populate `./checkpoints` with
   `scripts/download_checkpoints.sh` first, then supply it via a named `ckpts`
   context (bypasses `.dockerignore`) with `buildx` (see below). These two also
-  bake a ~23 MB uv cache and unset `UV_NO_CACHE`, which the `edge` model size
-  needs — without it the framework's `uv run`-ed HF CLI reaches for a package
-  index on every checkpoint resolve. See the `airgapped-base` stage in
+  bake a ~24 MB environment for the framework's `uv run`-ed HF CLI and point
+  `IMAGINAIRE_HF_CLI_ENVIRONMENT` at it — without that the CLI reaches for a
+  package index on every checkpoint resolve. See the `airgapped-base` stage in
   `docker/Dockerfile` for the mechanism.
   They also set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, so the baked,
   revision-pinned checkpoints are the only thing a model can load: some framework
@@ -63,7 +63,7 @@ Shared setup (used by both build types below):
 
 ```shell
 export TAG=cuda-13.2.1-develop-ubuntu24.04-amd64         # or -arm64
-export IMAGE=paidf-anomalygen:$TAG
+export IMAGE=cdf-anomalygen:$TAG
 
 # Target platform + GPU arch list (see the table below). The commands forward the
 # arch list from the environment with a bare `--build-arg TORCH_CUDA_ARCH_LIST`.
@@ -124,16 +124,16 @@ docker push "$REGISTRY/$IMAGE"
 
 ## 3. Run
 
-Use the image as a ready venv and bind-mount the repo over `/workspace/paidf-anomalygen`,
+Use the image as a ready venv and bind-mount the repo over `/workspace/cdf-anomalygen`,
 so it runs the current code/config plus the `datasets/` and base `checkpoints/`.
 `--user` + the `/etc/passwd` mount keep outputs host-owned and let `getpass.getuser()`
 resolve; `--shm-size` feeds the dataloader workers.
 
 Set `IMAGE` to whichever image you are using — the one built above, or a pulled
-`nvcr.io/nvidia/paidf-anomalygen:<tag>`.
+`nvcr.io/nvidia/cdf-anomalygen:<tag>`.
 
 > **The whole-tree bind mount below is a `develop` workflow.** It mounts the host checkout
-> *over* `/workspace/paidf-anomalygen`, which is where the image's own application code lives —
+> *over* `/workspace/cdf-anomalygen`, which is where the image's own application code lives —
 > so the code that runs is the host copy, and the `product` target's read-only application tree
 > is shadowed rather than enforced. That is the right trade for development, where running the
 > edited checkout is the whole point. If you chose `product` or `airgapped-product` *for* that
@@ -142,8 +142,8 @@ Set `IMAGE` to whichever image you are using — the one built above, or a pulle
 ```shell
 DOCKER="docker run --rm --gpus all --shm-size=16g \
   --user $(id -u):$(id -g) -e USER=$(id -un) -e HOME=/tmp -e HF_TOKEN \
-  -v $PWD:/workspace/paidf-anomalygen \
-  -w /workspace/paidf-anomalygen $IMAGE"
+  -v $PWD:/workspace/cdf-anomalygen \
+  -w /workspace/cdf-anomalygen $IMAGE"
 
 # interactive shell
 $DOCKER -it bash
@@ -173,11 +173,11 @@ and let the code come from the image:
 ```shell
 DOCKER_PRODUCT="docker run --rm --gpus all --shm-size=16g \
   --user $(id -u):$(id -g) -e USER=$(id -un) -e HOME=/tmp -e HF_TOKEN \
-  -v $PWD/datasets:/workspace/paidf-anomalygen/datasets:ro \
-  -v $PWD/checkpoints:/workspace/paidf-anomalygen/checkpoints:ro \
-  -v $PWD/results:/workspace/paidf-anomalygen/results \
-  -v $PWD/ag_config:/workspace/paidf-anomalygen/ag_config:ro \
-  -w /workspace/paidf-anomalygen $IMAGE"
+  -v $PWD/datasets:/workspace/cdf-anomalygen/datasets:ro \
+  -v $PWD/checkpoints:/workspace/cdf-anomalygen/checkpoints:ro \
+  -v $PWD/results:/workspace/cdf-anomalygen/results \
+  -v $PWD/ag_config:/workspace/cdf-anomalygen/ag_config:ro \
+  -w /workspace/cdf-anomalygen $IMAGE"
 
 # Verify the property actually holds — this must fail:
 $DOCKER_PRODUCT sh -c 'touch anomalygen/__init__.py' && echo "UNEXPECTED: app code is writable"

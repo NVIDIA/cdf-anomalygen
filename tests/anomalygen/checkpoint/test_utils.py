@@ -1,16 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the checkpoint integrity sidecars shared by the training and inference load paths."""
+"""Tests for the checkpoint integrity checks: the digest sidecars and the geometry stamp."""
 
 import hashlib
 import shutil
 import subprocess
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 import anomalygen.checkpoint.utils as ckpt_utils
-from anomalygen.checkpoint.utils import verify_manifest
+from anomalygen.checkpoint.utils import (
+    CLASS_LADDERS_KEY,
+    GEOMETRY_STAMP_KEY,
+    LEGACY_ORIGIN,
+    STAMP_ORIGIN_KEY,
+    build_geometry_stamp,
+    pop_and_verify_geometry_stamp,
+    upgrade_legacy_state,
+    verify_geometry_stamp,
+    verify_manifest,
+)
 
 
 def _write_checkpoint(tmp_path, payload=b"weights"):
@@ -190,3 +202,134 @@ def test_verify_manifest_reads_what_coreutils_sha256sum_writes(tmp_path, mode):
     manifest.write_text(out)
 
     assert verify_manifest(manifest, root) == []
+
+
+# --- geometry stamp -------------------------------------------------------------------------------
+
+
+def test_the_stamp_records_the_recipe_settings_the_weights_depend_on(stub_model):
+    # crop_ratio_range and inference_scale are absent on purpose: both may vary at generation.
+    assert build_geometry_stamp(stub_model()) == {
+        "crop_mode": "scale",
+        "input_size_ladder": [256, 512, 1024, 1536],
+        "shift": 1,
+        "model_size": "nano",
+        "anomaly_types": [["t", "big"], ["t", "small"]],
+    }
+
+
+def test_a_config_without_geometry_cannot_be_stamped():
+    # Every checkpoint this pipeline writes is stamped, so a model that cannot be is refused at save time.
+    with pytest.raises(ValueError, match="cannot stamp"):
+        build_geometry_stamp(SimpleNamespace(config=SimpleNamespace()))
+
+
+def test_a_matching_stamp_passes(stub_model):
+    verify_geometry_stamp(build_geometry_stamp(stub_model()), stub_model(), "iter_1.pt")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        (dict(ladder=(256, 512, 1024, 2048)), "input_size_ladder"),
+        (dict(shift=5), "shift"),
+        (dict(crop_mode="ratio"), "crop_mode"),
+        (dict(model_size="edge"), "model_size"),
+        (dict(anomaly_types=(("t", "big"), ("t", "hole"))), "anomaly_types"),
+    ],
+    ids=["ladder", "shift", "crop_mode", "model_size", "anomaly_types"],
+)
+def test_a_mismatch_raises_and_names_the_field(kwargs, expected, stub_model):
+    stamp = build_geometry_stamp(stub_model(**kwargs))
+    with pytest.raises(ValueError, match=expected):
+        verify_geometry_stamp(stamp, stub_model(), "iter_1.pt")
+
+
+@pytest.mark.parametrize("kind", ["absent", "partial"])
+def test_an_absent_or_partial_stamp_is_refused(kind, stub_model):
+    # Both mean a legacy checkpoint. The verifier refuses it; only the inference loader upgrades one
+    # first (see upgrade_legacy_state), so the message says what the checkpoint is good for.
+    stamp = None
+    if kind == "partial":
+        stamp = build_geometry_stamp(stub_model())
+        del stamp["anomaly_types"]
+    with pytest.raises(ValueError, match="legacy checkpoint.*cannot be resumed"):
+        verify_geometry_stamp(stamp, stub_model(), "iter_1.pt")
+
+
+def test_a_model_without_geometry_cannot_verify_a_stamp(stub_model):
+    with pytest.raises(ValueError, match="cannot stamp"):
+        verify_geometry_stamp(build_geometry_stamp(stub_model()), SimpleNamespace(config=SimpleNamespace()), "x")
+
+
+def test_pop_and_verify_takes_the_stamp_out_of_the_state(stub_model):
+    # The stamp is not a parameter: both load paths must remove it before the state reaches the model.
+    state = {"net.w": 0, GEOMETRY_STAMP_KEY: build_geometry_stamp(stub_model())}
+    pop_and_verify_geometry_stamp(state, stub_model(), "iter_1.pt")
+    assert state == {"net.w": 0}
+
+
+def test_the_per_class_caps_travel_beside_the_stamp_and_are_handed_back(stub_model):
+    # Training's caps are dataset state, not recipe geometry: they ride under their own key, the stamp
+    # neither carries nor compares them, and the load path returns them for the caller to attach.
+    assert build_geometry_stamp(stub_model(class_ladders={"t+small": [256]})) == build_geometry_stamp(stub_model())
+    state = {"net.w": 0, GEOMETRY_STAMP_KEY: build_geometry_stamp(stub_model()), CLASS_LADDERS_KEY: {"t+small": [256]}}
+    assert pop_and_verify_geometry_stamp(state, stub_model(), "iter_1.pt") == {"t+small": [256]}
+    assert state == {"net.w": 0}
+    assert (
+        pop_and_verify_geometry_stamp({GEOMETRY_STAMP_KEY: build_geometry_stamp(stub_model())}, stub_model(), "x")
+        is None
+    )
+
+
+# --- legacy checkpoints ---------------------------------------------------------------------------
+# No stamp, and class ids in the order the recipe listed them. The inference loader upgrades such a
+# state in memory: reorder to the sorted ids, then stamp from the recipe.
+
+
+def _legacy_state(num_classes=2):
+    """Class-stacked tensors whose class slice ``c`` is filled with ``c``, so a reorder is visible."""
+    stack = lambda shape: torch.stack([torch.full(shape, float(c)) for c in range(num_classes)])  # noqa: E731
+    return {
+        "net.a.lora_A": stack((2, 3)),
+        "net.a.lora_B": stack((3, 2)),
+        "net.text_prompt_emb": stack((4, 5)),
+        "net.g.lora_A.weight": torch.zeros(2, 3),  # the framework's global LoRA: rank first, not class
+    }
+
+
+def test_upgrade_reorders_classes_from_the_recipe_listing_to_sorted_and_stamps(stub_model):
+    # The model sorts to [t,big]=0, [t,small]=1; the recipe listed small first, so listed 0 = small.
+    state = _legacy_state()
+    upgrade_legacy_state(state, stub_model(), [["t", "small"], ["t", "big"]], "iter_1.pt")
+
+    for key in ("net.a.lora_A", "net.a.lora_B", "net.text_prompt_emb"):
+        assert state[key][0].eq(1.0).all() and state[key][1].eq(0.0).all(), key
+    assert torch.equal(state["net.g.lora_A.weight"], torch.zeros(2, 3)), "not class-stacked; left alone"
+    assert state[GEOMETRY_STAMP_KEY][STAMP_ORIGIN_KEY] == LEGACY_ORIGIN
+    # The result is a current state: the ordinary verifier accepts it.
+    assert pop_and_verify_geometry_stamp(state, stub_model(), "iter_1.pt") is None
+    assert GEOMETRY_STAMP_KEY not in state
+
+
+def test_upgrade_leaves_tensors_alone_when_the_listing_is_already_sorted(stub_model):
+    state, before = _legacy_state(), _legacy_state()
+    upgrade_legacy_state(state, stub_model(), [["t", "big"], ["t", "small"]], "iter_1.pt")
+    assert all(torch.equal(state[k], before[k]) for k in before)
+
+
+def test_upgrade_refuses_a_recipe_listing_a_different_class_set(stub_model):
+    with pytest.raises(ValueError, match="pass the recipe the checkpoint trained under"):
+        upgrade_legacy_state(_legacy_state(), stub_model(), [["t", "big"], ["t", "hole"]], "iter_1.pt")
+
+
+def test_upgrade_refuses_a_class_count_that_disagrees_with_the_recipe(stub_model):
+    with pytest.raises(ValueError, match="holds 3 classes, the recipe lists 2"):
+        upgrade_legacy_state(_legacy_state(num_classes=3), stub_model(), [["t", "big"], ["t", "small"]], "x")
+
+
+def test_upgrade_refuses_a_stamped_state(stub_model):
+    # A stamped checkpoint has its own class order; reordering it would corrupt it.
+    state = {**_legacy_state(), GEOMETRY_STAMP_KEY: build_geometry_stamp(stub_model())}
+    with pytest.raises(ValueError, match="is stamped"):
+        upgrade_legacy_state(state, stub_model(), [["t", "big"], ["t", "small"]], "iter_1.pt")

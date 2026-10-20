@@ -1,18 +1,18 @@
 # Running the container
 
-Only when the user asks to run it — building and pushing do not require this. Assumes `$IMAGE`
-from the shared variables in `SKILL.md`.
+Only when the user asks to run it — building and pushing do not require this. Assumes the `IMAGE`
+variable from the shared variables in `SKILL.md`.
 
 Bind-mount the repo over the workdir; `--user` keeps outputs host-owned; `--shm-size` feeds the
 dataloader workers. `-e USER` is what lets `getpass.getuser()` resolve the numeric UID: its lookup
-tries `$LOGNAME`, `$USER`, `$LNAME`, `$USERNAME` before falling back to the passwd database, so one
-env var is enough and the container never needs the host user list.
+tries the `LOGNAME`, `USER`, `LNAME` and `USERNAME` variables before falling back to the passwd
+database, so one env var is enough and the container never needs the host user list.
 
 ```shell
 docker run --rm -it --gpus all --shm-size=16g \
     --user $(id -u):$(id -g) -e USER=$(id -un) -e HOME=/tmp \
-    -v "$PWD:/workspace/paidf-anomalygen" \
-    -w /workspace/paidf-anomalygen "$IMAGE" bash
+    -v "$PWD:/workspace/cdf-anomalygen" \
+    -w /workspace/cdf-anomalygen "$IMAGE" bash
 ```
 
 **Downloading from the Hugging Face Hub** — only then, add the credential explicitly. It is readable

@@ -5,7 +5,7 @@
 
 The pairing / n_seeds derivation lives inside ``main()``, so it is driven
 end-to-end through ``main(argv)`` over an on-disk fixture (plus the importable
-``_images`` / ``_clean_pool`` helpers). The point is to lock the current,
+``_clean_pool`` helper). The point is to lock the current,
 correct behavior:
 
   * within pair budget (submasks × cleans) every (submask, clean) pair is unique,
@@ -19,6 +19,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from anomalygen.scripts.auto_mask_placement import roi_pair as B
@@ -217,3 +218,132 @@ def test_clean_pool_falls_back_to_texture_dir(tmp_path):
     _write_png(tmp_path / tex / "b.png")
     pool = B._clean_pool(tmp_path, tex)
     assert {p.name for p in pool} == {"a.png", "b.png"}
+
+
+def test_clean_pool_is_every_extension_case_insensitively_in_name_order(tmp_path):
+    """The listing AMP pairs against: png/jpg/jpeg/bmp by lower-cased suffix, sorted by name, a
+    non-image left out. Pinned so the shared lister cannot move a single clean or reorder the pool."""
+    d = tmp_path / "metal" / "clean_image"
+    for name in ("b.png", "a.jpeg", "C.JPG", "d.BMP"):
+        _write_png(d / name)
+    (d / "notes.txt").write_text("not an image")
+    assert [p.name for p in B._clean_pool(tmp_path, "metal")] == ["C.JPG", "a.jpeg", "b.png", "d.BMP"]
+
+
+# ===========================================================================
+# --per_clean_pairing
+# ===========================================================================
+# The round-robin above maximises (submask, clean) diversity and does NOT cover every clean image:
+# clean_idx = (i % S + i // S) % C depends only on the SUM of the two indices, so B rounds over S
+# submasks reach B + S - 1 distinct cleans, not B * S. When each clean image is a work item rather
+# than a backdrop — a joint crop that must be composited back onto a board — the required invariant is
+# the other one, and the shortfall is invisible because the record count is still right.
+def _run_pairing(tmp_path, *, n_submasks, n_cleans, allocation, mode, sd="cad_tht", seed=0, texture="SolderPin"):
+    anomaly = "interrupted"
+    full = f"{texture}+{anomaly}"
+    ds = tmp_path / "dataset"
+    for i in range(n_submasks):
+        _write_png(ds / texture / "mask" / anomaly / f"sub{i}.png")
+    for i in range(n_cleans):
+        _write_png(ds / texture / "clean_image" / f"clean{i}.png")
+        _write_png(ds / texture / "cad_mask" / f"clean{i}.png")
+    (ds / "semantic_segmentation_labels.json").write_text("{}")
+    spec = tmp_path / "defect_spec.jsonl"
+    spec.write_text(json.dumps({"defect_type": full, "spatial_dependency": sd}) + "\n")
+    alloc = tmp_path / "allocation.json"
+    alloc.write_text(json.dumps({full: allocation}))
+    out = tmp_path / "amp_samples.json"
+    # fmt: off
+    B.main([
+        "--dataset_dir", str(ds), "--defect_desc", str(spec), "--allocation", str(alloc),
+        "--output_pair_path", str(out), "--seed", str(seed), "--per_clean_pairing", mode,
+    ])
+    # fmt: on
+    return json.loads(out.read_text()), full
+
+
+def test_on_covers_every_clean(tmp_path):
+    """The invariant a composite-back-onto-a-board flow needs: every clean gets exactly one record."""
+    records, _ = _run_pairing(tmp_path, n_submasks=5, n_cleans=40, allocation=40, mode="on")
+    assert len(records) == 40
+    assert len({r["clean_image"] for r in records}) == 40
+    assert all(r["n_seeds"] == 1 for r in records)
+
+
+def test_the_default_is_the_diversity_pairing_for_every_route(tmp_path):
+    """The flag decides; the route does not.
+
+    An earlier design inferred per-clean pairing from ``spatial_dependency == "cad_tht"``, which made
+    one route behave differently by default. Pairing answers what the clean images ARE -- backdrops or
+    work items -- which no defect's placement route can know, so both of these take the round-robin.
+    """
+    for sd in ("cad_tht", "free"):
+        records, _ = _run_pairing(tmp_path / sd, n_submasks=5, n_cleans=40, allocation=40, mode="off", sd=sd)
+        assert len(records) == 40
+        # ceil(alloc/S) + S - 1 = 8 + 4 = 12 distinct cleans out of 40.
+        assert len({r["clean_image"] for r in records}) == 12, f"{sd} did not take the default pairing"
+
+
+def test_per_clean_uses_each_clean_exactly_once(tmp_path):
+    records, _ = _run_pairing(tmp_path, n_submasks=3, n_cleans=10, allocation=10, mode="on")
+    cleans = [r["clean_image"] for r in records]
+    assert len(cleans) == len(set(cleans)) == 10
+
+
+def test_per_clean_still_rotates_the_submask_bank(tmp_path):
+    """Submasks may repeat across joints — they are shape templates, not work items."""
+    records, _ = _run_pairing(tmp_path, n_submasks=3, n_cleans=9, allocation=9, mode="on")
+    assert len({r["submask"] for r in records}) == 3
+
+
+def test_per_clean_rejects_more_than_one_defect_type(tmp_path):
+    """One record per clean means one defect per clean; two types would both claim the same images."""
+    ds = tmp_path / "dataset"
+    spec_lines, alloc = [], {}
+    for anomaly in ("interrupted", "trapped"):
+        for i in range(2):
+            _write_png(ds / "SolderPin" / "mask" / anomaly / f"sub{i}.png")
+        alloc[f"SolderPin+{anomaly}"] = 2
+        spec_lines.append(json.dumps({"defect_type": f"SolderPin+{anomaly}", "spatial_dependency": "cad_tht"}))
+    for i in range(4):
+        _write_png(ds / "SolderPin" / "clean_image" / f"clean{i}.png")
+    spec = tmp_path / "defect_spec.jsonl"
+    spec.write_text("\n".join(spec_lines) + "\n")
+    alloc_path = tmp_path / "allocation.json"
+    alloc_path.write_text(json.dumps(alloc))
+
+    with pytest.raises(SystemExit, match="exactly one defect type"):
+        # fmt: off
+        B.main([
+            "--dataset_dir", str(ds), "--defect_desc", str(spec), "--allocation", str(alloc_path),
+            "--output_pair_path", str(tmp_path / "out.json"), "--per_clean_pairing", "on",
+        ])
+        # fmt: on
+
+
+def test_per_clean_refuses_an_allocation_larger_than_the_clean_pool(tmp_path):
+    """Unsatisfiable: 12 records cannot each take a distinct clean out of a pool of 8."""
+    with pytest.raises(SystemExit, match="only 8 clean image"):
+        _run_pairing(tmp_path, n_submasks=3, n_cleans=8, allocation=12, mode="on")
+
+
+def test_per_clean_warns_when_the_allocation_leaves_cleans_uncovered(tmp_path, loguru_lines):
+    """A deliberate subset is legitimate, but under-coverage must never be silent again."""
+    records, _ = _run_pairing(tmp_path, n_submasks=2, n_cleans=10, allocation=4, mode="on")
+    assert len(records) == 4
+    assert len({r["clean_image"] for r in records}) == 4
+    assert any("6 will get" in line for line in loguru_lines)
+
+
+def test_off_is_the_round_robin_on_a_cad_tht_dataset(tmp_path):
+    """A THT validation set wants diversity, not per-joint coverage."""
+    records, _ = _run_pairing(tmp_path, n_submasks=5, n_cleans=40, allocation=40, mode="off")
+    assert len(records) == 40
+    assert len({r["clean_image"] for r in records}) < 40
+
+
+def test_cad_tht_records_carry_the_cad_fields(tmp_path):
+    records, _ = _run_pairing(tmp_path, n_submasks=2, n_cleans=4, allocation=4, mode="on")
+    for r in records:
+        assert r["cad_mask"] is not None and r["cad_mask_label"] is not None
+        assert Path(r["cad_mask"]).stem == Path(r["clean_image"]).stem

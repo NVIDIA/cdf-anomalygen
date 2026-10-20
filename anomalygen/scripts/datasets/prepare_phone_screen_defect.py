@@ -17,7 +17,8 @@ Image filename mapping (Roboflow hash removed):
   Sta_0067_jpg.rf.<hash>.jpg  ->  anomaly_image/stain/Sta_0067.png
   0001_png.rf.<hash>.png      ->  clean_image/0001.png
 
-Output layout (masks always from HF; anomaly + clean images require --zip):
+Output layout (masks always from HF; anomaly + clean images require --zip, which is REQUIRED
+unless --masks_only says the images are deliberately being left out):
   <output_dir>/
     Phone/
       anomaly_image/
@@ -46,8 +47,10 @@ Usage:
     python3 -m anomalygen.scripts.datasets.prepare_phone_screen_defect --output_dir <output_dir> \\
         --zip <path/to/downloaded.zip> --dryrun
 
-  To pull just the masks/defect_spec (skipping the Roboflow zip):
-    python3 -m anomalygen.scripts.datasets.prepare_phone_screen_defect --output_dir <output_dir>
+  To pull just the masks/defect_spec (skipping the Roboflow zip) -- a dataset with no images,
+  which nothing can generate from, so it has to be asked for explicitly:
+    python3 -m anomalygen.scripts.datasets.prepare_phone_screen_defect --output_dir <output_dir> \\
+        --masks_only
 
 Every prepare_*.py follows the same phases: preflight -> download -> post_process (dryrun previews).
 """
@@ -64,6 +67,10 @@ from pathlib import Path
 from PIL import Image
 
 HF_MASKS_REPO_ID = "nvidia/Cosmos-AnomalyGen-Glass-Masks"
+ROBOFLOW_URL = "https://universe.roboflow.com/vu-thi-thu-huyen/mobile-screen"
+# The staging spelling, shown in the failure because that is where most callers now arrive from --
+# the entrypoint runs this script and the person reading the error is editing a config, not a shell.
+USECASE_HINT = "usecase://phone_screen?zip=s3://<bucket>/mobile-screen.zip"
 # Pinned to a commit, not "main" — see the rationale in prepare_pcb_defect.py: a mutable revision
 # lets the masks this pipeline places change under the same command.
 HF_MASKS_DEFAULT_REVISION = "e15b6827eed41d10f812739586d8c057a3b26c12"
@@ -74,6 +81,32 @@ KEEP_ANOMALY = {
     "scratch": {"Scr_0001", "Scr_0021", "Scr_0041", "Scr_0061", "Scr_0081"},
     "stain": {"Sta_0001", "Sta_0021", "Sta_0041", "Sta_0061", "Sta_0081"},
 }
+
+
+def require_images(args) -> None:
+    """0. Refuse a run that would write a dataset with no images in it.
+
+    The masks and the defect_spec come from Hugging Face; the images do not exist anywhere this can
+    reach, so without --zip this script writes masks and exits 0. That is the worst shape a failure
+    can take here: `usecase://phone_screen` fetched cleanly, Phone/clean_image/ was simply absent,
+    and what surfaced was an override refusing a path that is "not in the fetched input" or an AMP
+    run with no exemplar -- neither of which mentions a zip.
+
+    Checked BEFORE the Hugging Face auth below and before anything is downloaded: a missing zip does
+    not need a token to diagnose, and reporting the token first would send someone to fix a
+    credential and come back to the real problem on the next run.
+    """
+    if args.zip or args.masks_only:
+        return
+    sys.exit(
+        "ERROR: this dataset's anomaly and clean images are not downloadable.\n"
+        "  They come from a Roboflow COCO export that has to be downloaded by hand:\n"
+        f"    {ROBOFLOW_URL}\n"
+        "  Then pass it: --zip <path/to/mobile-screen.zip>\n"
+        f"    ...or through a use-case: {USECASE_HINT}\n"
+        "  To fetch only the masks and defect_spec -- a dataset nothing can generate from -- pass\n"
+        "  --masks_only and mean it."
+    )
 
 
 def preflight(args) -> None:
@@ -183,14 +216,26 @@ def dryrun(args) -> None:
 
 
 def main(argv=None) -> None:
+    # allow_abbrev=False: argparse otherwise accepts any unambiguous abbreviation of a long option,
+    # and these scripts are launched by `usecase://<name>?<p>=...`, where the parameter names come
+    # from a config. `?output=` reached --output_dir that way and sent the dataset wherever the
+    # config said. staging/usecase.py guards its own flag too, but only the parser can close the
+    # class: a flag added here later would reopen it, and every abbreviation of it with it.
     parser = argparse.ArgumentParser(
         description="Prepare the Mobile Phone Screen defect dataset for AnomalyGen (Roboflow images + HF masks).",
+        allow_abbrev=False,
     )
     parser.add_argument("--output_dir", required=True, help="Destination directory for the prepared dataset")
     parser.add_argument(
         "--zip",
         metavar="mobile_screen.zip",
         help="Optional Roboflow zip; when given, its anomaly + clean images are extracted",
+    )
+    parser.add_argument(
+        "--masks_only",
+        action="store_true",
+        help="Fetch the masks and defect_spec WITHOUT the Roboflow images. The result has no clean "
+        "or anomaly images, so nothing can be generated from it; for inspecting the masks.",
     )
     parser.add_argument(
         "--dryrun", action="store_true", help="Show what would be extracted/downloaded without writing files"
@@ -201,6 +246,7 @@ def main(argv=None) -> None:
     if args.dryrun:
         dryrun(args)
         return
+    require_images(args)
     print("[1/3] preflight: checking Hugging Face auth + inputs")
     preflight(args)
     print(f"[2/3] download: fetching masks + defect_spec from {HF_MASKS_REPO_ID}")
@@ -208,7 +254,7 @@ def main(argv=None) -> None:
     if args.zip:
         print(f"[3/3] post_process: extracting curated images from {Path(args.zip).name}")
     else:
-        print("[3/3] post_process: skipped (no --zip; masks only)")
+        print("[3/3] post_process: skipped (--masks_only; no images in this dataset)")
     post_process(args, raw)
 
     out = Path(args.output_dir)

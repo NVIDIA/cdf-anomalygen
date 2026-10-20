@@ -23,12 +23,11 @@ generated sample, then keeps the top ``(1 - drop_ratio)`` fraction per anomaly t
   (including the top one), so ``aq_rank`` is not guaranteed to match ``nn``'s ranking. Ranking per
   type removes any cross-type scale confound. See :func:`compute_aq_rank_scores`.
 
-  ``aq_rank`` is opt-in, not the default. Across five internal datasets it has the best *mean*
-  ranking of the schemes we tried, but its sign is self-supervised from ``nn``'s extremes, so on a
-  dataset where ``nn`` itself is weak the compass can sign an axis the wrong way and score *below*
-  plain ``nn`` (observed on one of the five). How best to fuse the four metrics into one score is
-  still open; until it is settled ``--score`` defaults to ``nn`` and ``aq_rank`` is offered as an
-  advanced option.
+  ``aq_rank`` is opt-in, not the default. Across five internal datasets it had the best *mean*
+  ranking of the schemes tried, but its sign is self-supervised from ``nn``'s extremes: a weak NN
+  anchor can orient an axis incorrectly and score below plain ``nn`` (observed on one of the five).
+  That filter-time counterexample is not replaced by refinement's later 2AFC pilot. AQ-Rank is not a
+  human-alignment guarantee, so ``--score`` defaults to the simpler ``nn`` objective.
 
 Note: this is the cosmos3 successor of the old GIQA-based ``filter.py``. cosmos3 ships NN/MNN
 correspondence (and set-level FID) rather than the old per-sample GIQA metric, so filtering ranks
@@ -60,7 +59,9 @@ import numpy as np
 from cosmos_framework.inference.common.init import init_script
 from cosmos_framework.utils import log
 
-init_script(training=False)
+# Guarded because it disables autograd process-wide; importing this module must leave it alone.
+if __name__ == "__main__":
+    init_script(training=False)
 
 from anomalygen.eval.anomaly_quality import GEOMETRY_AXES, augment_with_quality, compute_anomaly_quality_kpi
 from anomalygen.eval.correspondence import (
@@ -269,8 +270,7 @@ def main(argv=None) -> None:
         default="nn",
         help="rank samples by this score (default: nn): nn/mnn (correspondence only, no SAM); a single "
         "axis completeness/precision/boundary_iou; aq_nn (absolute per-sample completeness + nn_score); "
-        "or aq_rank (rank-relative compass composite of nn + the three axes — see the module docstring; "
-        "how best to fuse the four metrics is still under study, so it is opt-in rather than the default)",
+        "or aq_rank (optional rank-relative compass composite of nn + the three axes; see the module docstring)",
     )
     parser.add_argument("--drop_ratio", type=float, required=True, help="fraction in [0, 1] to drop per anomaly type")
     parser.add_argument(

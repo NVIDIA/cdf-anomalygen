@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The model registry: THE one place a model name becomes an endpoint. Nothing is built into the
+# code — copy this file to ~/.anomalygen/endpoints.yaml (outside the repo, so a real key never
+# enters version control); every run picks it up automatically, from any directory, or pass
+# --model-registry <path>.
+#
+# Every entry is the same three fields, whatever the endpoint. A model named by --gen-model /
+# --judge-model with no entry here refuses the run before anything is spent — there is no
+# environment fallback. Logs only ever say whether a key is set, never its value. `model:` must
+# equal the name the SERVER calls itself (a vllm recipe's --served-model-name; a gateway's model
+# id); `base_url:` carries the version segment, exactly like the OpenAI SDK's base_url.
+
+- model: azure/openai/gpt-6-astra    # the shipped cloud recipe (--gen-model / --judge-model): GPT-6 Astra on the NVIDIA gateway
+  base_url: https://inference-api.nvidia.com/v1   # OpenAI-SDK base URL, version segment included
+  key: <your inference hub token>
+
+# The same model straight from OpenAI, without a gateway: the entry changes, the code does not.
+# `gpt-6-astra` is OpenAI's own id for GPT-6 Astra (the gateway prefix names the provider behind
+# it); the transport already speaks what a reasoning model there requires (`max_completion_tokens`,
+# no sampling parameters). Pass this id to --gen-model / --judge-model.
+# - model: gpt-6-astra
+#   base_url: https://api.openai.com/v1
+#   key: <your OpenAI API key>
+
+- model: nvidia/google/gemma-4-31b-it     # the shipped recipe: scripts/agentic_mask_generation_serving/gemma-4-31b-it.sh
+  base_url: http://localhost:8902/v1      # the recipe's default port
+  key: EMPTY                              # EMPTY (or omit) for an unlocked server; if it was
+  #                                       # started with API_KEY=<secret>, put the same value here

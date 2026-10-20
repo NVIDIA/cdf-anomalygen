@@ -193,8 +193,14 @@ def dryrun(args) -> None:
 
 
 def main(argv=None) -> None:
+    # allow_abbrev=False: argparse otherwise accepts any unambiguous abbreviation of a long option,
+    # and these scripts are launched by `usecase://<name>?<p>=...`, where the parameter names come
+    # from a config. `?output=` reached --output_dir that way and sent the dataset wherever the
+    # config said. staging/usecase.py guards its own flag too, but only the parser can close the
+    # class: a flag added here later would reopen it, and every abbreviation of it with it.
     parser = argparse.ArgumentParser(
-        description="Download and prepare the Magnetic Tile defect dataset for AnomalyGen."
+        description="Download and prepare the Magnetic Tile defect dataset for AnomalyGen.",
+        allow_abbrev=False,
     )
     parser.add_argument("--output_dir", required=True, help="Destination directory for the prepared dataset")
     parser.add_argument(

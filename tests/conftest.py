@@ -7,7 +7,8 @@ Provides the ``gpu`` marker: tag any test that needs a CUDA GPU with
 ``@pytest.mark.gpu`` and it is skipped automatically when no CUDA device is
 available — so the suite stays green on CPU-only / no-dedicated-GPU runners.
 
-Also provides ``loguru_lines``, for asserting on what a module logged.
+Also provides ``loguru_lines``, for asserting on what a module logged, and restores autograd around
+every test (importing an inference entry point turns it off process-wide).
 """
 
 import pytest
@@ -33,6 +34,24 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "gpu" in item.keywords:
             item.add_marker(skip_gpu)
+
+
+@pytest.fixture(autouse=True)
+def _autograd_enabled():
+    """Run every test with autograd on, whatever a previously imported module did to it.
+
+    The framework's ``init_script`` disables autograd process-wide. The pipeline scripts guard that
+    call behind ``__main__`` so importing them is inert, but pytest imports every test module during
+    collection, so one unguarded call anywhere would silently turn gradients off session-wide.
+    """
+    import torch
+
+    was_enabled = torch.is_grad_enabled()
+    torch.set_grad_enabled(True)
+    try:
+        yield
+    finally:
+        torch.set_grad_enabled(was_enabled)
 
 
 @pytest.fixture

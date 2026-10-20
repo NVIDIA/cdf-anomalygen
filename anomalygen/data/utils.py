@@ -2,15 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Shared data helpers for the anomaly pipeline: caption building, tokenizer/prompt utilities,
-image/mask directory pairing, and source (conditioning) item construction."""
+image/mask directory pairing, source (conditioning) item construction, and batch collation."""
 
 from __future__ import annotations
 
 import os
 import re
-from typing import List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
+
+from anomalygen.configs.texture.constants import VISION_TOKEN_PX
 
 # Single editing-instruction caption shared by training and inference.
 CAPTION_TEMPLATE = (
@@ -19,8 +23,38 @@ CAPTION_TEMPLATE = (
     "Incomplete, Malformed, Contaminated, Under-processed, Faulty, Blemished, Expired."
 )
 
+# Ceiling on the caption tokens charged to a sample, both for a free-length caption and for the
+# length the learnable text prompt pads to. The packed-sequence headroom check is computed against
+# it, so going over would make that check under-estimate and the packer would silently discard
+# largest-size samples. Lives here so the ceiling sits beside the template it bounds.
+CAPTION_TOKEN_BUDGET = 256
+
+# Prompt for the CFG unconditional branch (inference only; training never sees it). It asks for an
+# unchanged reconstruction rather than for a "normal product": reconstruction is what an
+# image-to-image model does natively, so the branch stays defect-free without inventing content.
+# Class-agnostic on purpose — naming a texture or defect would put that concept on the guided axis.
+UNCONDITIONAL_CAPTION = (
+    "A static, unchanged video showing the exact same contents in all frames. "
+    "Nothing is added, removed, or altered; the surface continues uniformly with no marks. "
+    "Static, unchanged, identical, unmodified, original, untouched, consistent, stable, "
+    "intact, uniform, clean, normal, defect-free."
+)
+
 IMAGE_EXTS = (".png", ".jpg", ".jpeg")
+# What a dataset directory — a clean pool, a submask source — is listed by; BMP is taken there too.
+DATASET_IMAGE_EXTS = IMAGE_EXTS + (".bmp",)
 MASK_FG_THRESHOLD = 128  # Foreground threshold for binarizing a uint8 mask (0–255).
+
+
+def sample_token_count(input_w: int, input_h: int, caption_tokens: int = CAPTION_TOKEN_BUDGET) -> int:
+    """Packed tokens of one sample: two vision items of ``(w/32)*(h/32)`` tokens plus two delimiters
+    each, the caption, and one EOS. Mirrors the framework's ``_compute_num_tokens_per_sample``."""
+    return 2 * ((input_w // VISION_TOKEN_PX) * (input_h // VISION_TOKEN_PX) + 2) + caption_tokens + 1
+
+
+# Keys carrying a per-sample tensor whose spatial shape follows that sample's input size, and which must
+# therefore survive collation as a plain list rather than being stacked.
+RAGGED_KEYS = ("edit_mask",)
 
 
 def build_caption(defect: str, texture: str) -> str:
@@ -28,6 +62,15 @@ def build_caption(defect: str, texture: str) -> str:
         defect=defect.replace("-", " ").replace("_", " "),
         texture=texture.replace("-", " ").replace("_", " "),
     )
+
+
+def anomaly_class_ids(anomaly_types: Sequence[Sequence[str]]) -> Dict[str, int]:
+    """``{"texture+defect": class_id}``, the id being the pair's position in ``anomaly_types``.
+
+    The one id assignment training, validation and generation share. The recipe builder sorts the
+    list and the checkpoint stamps it, so the ids never depend on the order a recipe was written in.
+    """
+    return {f"{t}+{d}": i for i, (t, d) in enumerate(anomaly_types)}
 
 
 # Each half must be one safe path segment: an anomaly type becomes a directory name downstream.
@@ -117,6 +160,31 @@ def build_source_item(
     return background * (1.0 - m3) + noise * m3
 
 
+def list_images(d) -> List[Path]:
+    """Every image directly under directory ``d`` — ``DATASET_IMAGE_EXTS`` matched on the lower-cased
+    suffix, so ``c0.JPG`` is listed like ``c0.jpg`` — sorted by name; ``[]`` when ``d`` is not a
+    directory. The ONE listing of a dataset directory (clean pools, submask sources) for AMG and the
+    AMP scripts, so every stage sees the same files in the same order.
+    """
+    d = Path(d)
+    if not d.is_dir():
+        return []
+    return sorted(p for p in d.iterdir() if p.suffix.lower() in DATASET_IMAGE_EXTS)
+
+
+def require_same_size(image, mask, ident: str = "") -> None:
+    """Raise unless a paired image and mask have identical pixel dimensions.
+
+    The crop planner reads its extent from the image and its bbox from the mask, so a mismatched
+    pair produces a wrong-scale, misaligned crop rather than an error.
+    """
+    if image.size != mask.size:
+        raise ValueError(
+            f"image/mask size mismatch{f' for {ident}' if ident else ''}: image is "
+            f"{image.size[0]}x{image.size[1]} but mask is {mask.size[0]}x{mask.size[1]}."
+        )
+
+
 def list_image_mask_pairs(img_dir: str, mask_dir: str, mask_suffix: str = "") -> List[Tuple[str, str]]:
     """List ``(image_path, mask_path)`` pairs for images in ``img_dir``.
 
@@ -138,3 +206,31 @@ def list_image_mask_pairs(img_dir: str, mask_dir: str, mask_suffix: str = "") ->
         pairs.append((os.path.join(img_dir, fn), mask_path))
 
     return pairs
+
+
+def anomalygen_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """``custom_collate_fn`` plus pass-through (list) collation for the ragged keys.
+
+    The framework's ``custom_collate_fn`` list-collates a fixed set of keys (``images``,
+    ``image_size``, ``text_token_ids``, ...) and sends everything else through ``default_collate``,
+    which stacks. Our ``edit_mask`` is not in that set, so under variable-resolution training it
+    raises ``RuntimeError: stack expects each tensor to be equal size`` as soon as two samples in a
+    batch have different input sizes.
+
+    ``RankPartitionedDataLoader`` forwards ``**dataloader_kwargs`` to ``torch.utils.data.DataLoader``
+    and only *defaults* ``collate_fn`` to its own, so supplying ours takes precedence.
+
+    ``model._per_item_pixel_masks`` already accepts either a list of tensors or a stacked
+    ``[B,1,H,W]`` tensor, so the consumer side needs no change.
+    """
+    # All-or-nothing per key: a key present on only some samples is left to ``custom_collate_fn``,
+    # which drops it from the batch rather than emitting a partial list.
+    ragged = {k: [sample[k] for sample in batch] for k in RAGGED_KEYS if batch and all(k in sample for sample in batch)}
+    if not ragged:
+        return custom_collate_fn(batch)
+
+    # Shallow-copy so the caller's sample dicts are left intact (they may be reused by the loader).
+    stripped = [{k: v for k, v in sample.items() if k not in ragged} for sample in batch]
+    collated = custom_collate_fn(stripped)
+    collated.update(ragged)
+    return collated

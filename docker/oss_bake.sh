@@ -6,15 +6,19 @@
 #
 #   archives   pinned tarballs no index serves (apex, flash-attn-3-nv, sam-2) plus uv, CPython and
 #              the GCC whose libquadmath the numpy/scipy wheels bundle
-#   apt        Debian source for the packages the Dockerfile adds on top of the base image
-#   pip        sdist per venv distribution, or the wheel where none is published
+#   apt        Debian source for the packages the Dockerfile adds on top of the base image; runs in
+#              the apt-install RUN, off the Sources index that install fetched
+#   pip        sdist per distribution of EVERY venv in $OSS_VENVS, or the wheel where none is
+#              published; the venvs' lists are merged and de-duplicated on name AND version
 #   manifest   sha256 roll-up over the whole bake, for audit — run it last
 #
 # Runs inside the image being built; the Dockerfile COPYs it to /usr/local/bin/oss-bake. Versions and
 # digests come from the Dockerfile PINS block, which declares them as ARGs in the runtime stage, so
 # they arrive here as environment variables and keep a single home. `archives` and `pip` also need
-# TORCH_INDEX_URL. `apt` consumes and deletes the pre-install dpkg snapshot, so it runs once per
-# image; `pip` skips what is already in pip/, which makes the develop second pass a delta.
+# TORCH_INDEX_URL, and `pip` needs OSS_VENVS — the same single-home rule, so that adding a venv is an
+# edit in the file that creates it rather than a list hidden in here. `apt` consumes and deletes the
+# pre-install dpkg snapshot, so it runs once per image; `pip` skips what is already in pip/, which
+# makes the develop second pass a delta.
 #
 # `set -eu`, NOT `-o pipefail`: several counts are `ls ... | wc -l` over globs that legitimately match
 # nothing, and pipefail would turn those into a failed build.
@@ -25,11 +29,15 @@ usage() {
   exit 64
 }
 
+# Every download goes through this: HTTPS only, on the redirect too, so no mirror can bounce a
+# request onto plaintext.
+https_get() { curl -fsSL --proto '=https' --proto-redir '=https' "$@"; }
+
 # Digest-checked, so MANIFEST certifies verified bytes rather than whatever the network returned.
 # ${VAR:?} on every pin: an ARG that is declared but empty would otherwise build a garbage URL.
 fetch() {  # fetch <url> <out> <sha256>
   local url="$1" out="$2" sha="$3"
-  curl -fsSL --proto '=https' --proto-redir '=https' "$url" -o "$out"
+  https_get "$url" -o "$out"
   echo "${sha}  ${out}" | sha256sum -c - >/dev/null
 }
 
@@ -55,18 +63,24 @@ bake_archives() {
   for u in "https://ftp.gnu.org/gnu/gcc/gcc-$V/gcc-$V.tar.xz" \
            "https://mirrors.kernel.org/gnu/gcc/gcc-$V/gcc-$V.tar.xz" \
            "https://gcc.gnu.org/pub/gcc/releases/gcc-$V/gcc-$V.tar.xz"; do
-      if curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --retry 2 "$u" -o "$F"; then break; fi
+      if https_get --connect-timeout 15 --retry 2 "$u" -o "$F"; then break; fi
   done
   echo "${LIBGFORTRAN_LIBQUADMATH_GCC_TARBALL_SHA256:?}  $F" | sha256sum -c - >/dev/null
   echo "OSS bake archives: $(ls "$D"/*.tar.* "$D"/source-builds/*.tar.* 2>/dev/null | wc -l) pinned archives"
 }
 
-# Source at the INSTALLED version, so it matches the binary that ships.
+# Source at the INSTALLED version, so it matches the binary that ships. No `apt-get update` of its
+# own: it reads the index the caller installed from, so binaries and sources come from one archive
+# state. Ubuntu keeps only the newest version of a source in each pocket, so a fetch against a
+# later index fails for every package a security update has since replaced.
 bake_apt() {
   D=/usr/share/oss-sources/apt
   mkdir -p "$D"
-  sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
-  apt-get update -qq
+  # apt stores the index compressed (Sources.lz4 here), so match on the stem.
+  if ! ls /var/lib/apt/lists/*_source_Sources* >/dev/null 2>&1; then
+      echo "OSS bake apt: no Sources index — enable deb-src and apt-get update in the same RUN first" >&2
+      exit 1
+  fi
   # Added = source packages present now, minus the pre-install snapshot.
   dpkg-query -W -f='${source:Package}\t${source:Version}\n' | sort -u \
     | awk -F'\t' 'NR==FNR{base[$0]=1; next} !($1 in base){print $1 "=" $2}' \
@@ -90,48 +104,100 @@ bake_apt() {
       echo "OSS bake apt: expected ${expected}; refusing to ship partial source coverage" >&2
       exit 1
   fi
-  # deb-src is a build-time need; leaving it on changes `apt-get update` for the user.
-  sed -i 's/^Types: deb deb-src$/Types: deb/' /etc/apt/sources.list.d/ubuntu.sources
-  rm -rf /var/lib/apt/lists/* /tmp/_added.txt /var/lib/oss-pkgs-before.txt
+  rm -f /tmp/_added.txt /var/lib/oss-pkgs-before.txt
 }
 
 # The sdist for every distribution, uniformly — one rule to state, no per-package judgement about
 # whether an installed tree happens to be the source. Where none is published the wheel goes in
 # instead; that is not source and is not pretended to be, it is what is being redistributed.
+#
+# Every venv in $OSS_VENVS — one today, but each venv the image ships is a redistribution. The
+# lists are merged into one flat pip/ directory and de-duplicated on name AND version, the only
+# dedup that stays correct if a second venv ever pins a project at a different version — those are
+# two obligations, not one. Filenames already carry the version, so no per-venv attribution is
+# needed to tell them apart.
 bake_pip() {
   D=/usr/share/oss-sources/pip
   mkdir -p "$D"
-  # Tags picking the one wheel that belongs in this image, asked of the interpreter:
-  # an empty ${PY_VER} would widen the grep instead of failing.
-  PYTAG=$(/opt/venv/bin/python -c 'import sys; print("cp%d%d" % sys.version_info[:2])')
   ARCH=$(uname -m)
   # Already fetched, so a second pass is a delta. Case- and separator-insensitive:
   # sdist filenames keep the project spelling (PyYAML-6.0.3.tar.gz), this loop is PEP 503.
   have=$(ls "$D" 2>/dev/null | tr '[:upper:]_' '[:lower:]-')
-  # Excluded: nvidia-*/cuda-* are NVIDIA wheels; paidf-anomalygen and lerobot-stub are
-  # this repo. Neither is third-party OSS.
-  /opt/venv/bin/python -c '
+
+  PYTAG=""
+  nvenvs=0
+  : > /tmp/_dists_raw.txt
+  # Unquoted on purpose: the list is several paths.
+  for venv in ${OSS_VENVS:?}; do
+      nvenvs=$((nvenvs + 1))
+      # The list names what the image ships. A path that is not there is a Dockerfile bug, and a
+      # skipped venv is exactly the silent gap this whole file exists to prevent.
+      if [[ ! -x "$venv/bin/python" ]]; then
+          echo "OSS bake pip: OSS_VENVS names $venv but there is no interpreter at $venv/bin/python" >&2
+          exit 1
+      fi
+      # Tag picking the one wheel that belongs in this image, asked of the interpreter:
+      # an empty ${PY_VER} would widen the grep instead of failing.
+      tag=$("$venv/bin/python" -c 'import sys; print("cp%d%d" % sys.version_info[:2])')
+      if [[ -z "$PYTAG" ]]; then
+          PYTAG="$tag"
+      elif [[ "$tag" != "$PYTAG" ]]; then
+          # One tag drives the wheel fallback over the merged list, so two Python versions would
+          # silently record the wrong interpreter's wheel for one venv's packages.
+          echo "OSS bake pip: $venv is $tag, not $PYTAG — every venv must share one Python" >&2
+          exit 1
+      fi
+      # Excluded: nvidia-*/cuda-* are NVIDIA wheels; cdf-anomalygen and the three stubs are
+      # this repo, their source in the image under assets/. Neither is third-party OSS. Re-checked against vllm 0.29.0's tree
+      # (cuda-bindings, nvidia-cutlass-dsl, nvidia-nvshmem-cu13, ...): nothing else these two
+      # prefixes fail to catch. The NVIDIA-authored wheels outside them (nccl4py, nvtx) are
+      # Apache-2.0, so they belong in the bake.
+      "$venv/bin/python" -c '
 import importlib.metadata as md, re
 for dist in md.distributions():
     name = dist.metadata["Name"]
     if not name:
         continue
     key = re.sub(r"[-_.]+", "-", name).lower()
-    if key.startswith(("nvidia-", "cuda-")) or key in ("paidf-anomalygen", "lerobot-stub"):
+    if key.startswith(("nvidia-", "cuda-")) or key in ("cdf-anomalygen", "lerobot-stub", "pycountry-stub", "nltk-stub"):
         continue
     print(key, dist.version)
-' | sort -u > /tmp/_dists.txt
+' >> /tmp/_dists_raw.txt
+  done
+  sort -u /tmp/_dists_raw.txt > /tmp/_dists.txt
+  rm -f /tmp/_dists_raw.txt
   # An empty list would report "0 sdists" and exit 0 — the silent-empty failure again.
   if [[ ! -s /tmp/_dists.txt ]]; then
       echo "OSS bake pip: enumerated no distributions" >&2
       exit 1
   fi
+  echo "OSS bake pip: $(wc -l < /tmp/_dists.txt) distributions over ${nvenvs} venvs"
+
+  # The wheel tags this interpreter can install, spelled out rather than left as a bare "$PYTAG"
+  # substring, because that substring also matches cp313-cp313t — the FREE-THREADED build, a
+  # different interpreter and a different artefact. PyPI lists it last for torch, torchvision,
+  # torchaudio and triton, so a bare substring match makes `tail -n1` pick precisely the wrong
+  # wheel. The abi3 half is the opposite failure: tokenspeed-triton (a vllm dependency) publishes
+  # no sdist and no cp313 wheel at all, only cp312-abi3, which this image does install and must
+  # therefore redistribute.
+  # Enumerated from PYTAG rather than written as a range so the abi3 bound moves with the Python.
+  alts="${PYTAG}-(${PYTAG}|none)|py3-none|py2\.py3-none"
+  for m in $(seq 2 "${PYTAG#cp3}"); do alts="${alts}|cp3${m}-abi3"; done
+  WHEELTAG="-(${alts})-"
+
   while read -r name ver; do
-      if printf '%s\n' "$have" | grep -q "^${name}-"; then
+      # Name AND version. A name-only match would skip another venv's copy of a project already
+      # contributed at a different version, dropping source we ship. Only "."
+      # and "+" of a PEP 440 version are ERE metacharacters. The trailing class is what stops 1.2
+      # matching 1.20: every filename continues with "-" (wheel tag), "." (.tar.gz) or "+" (local
+      # version). If a version ever normalises differently in the filename this re-fetches, which
+      # is idempotent — the failure mode of this pattern is a wasted download, never a gap.
+      verpat=$(printf '%s' "$ver" | sed 's/[.+]/\\&/g')
+      if printf '%s\n' "$have" | grep -qE -- "^${name}-${verpat}[-.+]"; then
           continue
       fi
       # One request; the wheel fallback below re-reads this response.
-      json=$(curl -fsSL --proto '=https' --proto-redir '=https' "https://pypi.org/pypi/${name}/${ver}/json" 2>/dev/null || true)
+      json=$(https_get "https://pypi.org/pypi/${name}/${ver}/json" 2>/dev/null || true)
       meta=$(printf '%s' "$json" \
           | jq -r '[.urls[] | select(.packagetype=="sdist")]
                    | if length > 0 then (.[0] | [.url, .digests.sha256] | @tsv) else empty end')
@@ -140,7 +206,7 @@ for dist in md.distributions():
       if [[ -z "$url" ]]; then
           meta=$(printf '%s' "$json" \
               | jq -r '.urls[] | select(.packagetype=="bdist_wheel") | [.url, .digests.sha256] | @tsv' \
-              | grep -E "(${PYTAG}|py3-none|py2\.py3-none)" | grep -E "(${ARCH}|any)\.whl" | tail -n1)
+              | grep -E -- "$WHEELTAG" | grep -E "(${ARCH}|any)\.whl" | tail -n1)
           url=$(printf '%s' "$meta" | cut -f1)
           sha=$(printf '%s' "$meta" | cut -f2)
       fi
@@ -148,9 +214,9 @@ for dist in md.distributions():
           # Not on PyPI: in this image that means the torch index, a PEP 503 page. Prefer a
           # #sha256 fragment; torch stopped publishing them at 2.13.0, so fall back to the
           # bare link rather than dropping torch out of the bake.
-          idx=$(curl -fsSL --proto '=https' --proto-redir '=https' "${TORCH_INDEX_URL}/${name}/" 2>/dev/null || true)
+          idx=$(https_get "${TORCH_INDEX_URL}/${name}/" 2>/dev/null || true)
           vpat="-$(printf '%s' "$ver" | sed 's/+/%2B/')-"
-          pick() { grep -F -- "$vpat" | grep -E "(${PYTAG}|py3-none)" | grep -E "(${ARCH}|any)" | tail -n1; }
+          pick() { grep -F -- "$vpat" | grep -E -- "$WHEELTAG" | grep -E "(${ARCH}|any)" | tail -n1; }
           href=$(printf '%s' "$idx" | grep -oE 'href="[^"]+\.whl#sha256=[a-f0-9]+"' | sed 's/^href="//; s/"$//' | pick)
           if [[ -n "$href" ]]; then
               url=${href%%#*}
@@ -174,7 +240,7 @@ for dist in md.distributions():
       fi
       # %2B back to +: the index percent-encodes the local version, the artefact does not.
       out="$D/$(basename "${url%%#*}" | sed 's/%2B/+/g')"
-      curl -fsSL --proto '=https' --proto-redir '=https' "$url" -o "$out"
+      https_get "$url" -o "$out"
       if [[ -n "$sha" ]]; then
           echo "${sha}  ${out}" | sha256sum -c - >/dev/null
       fi

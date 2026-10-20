@@ -9,13 +9,15 @@ This script is a thin wrapper around ``huggingface_hub.snapshot_download`` plus
 a defensive single-wrapper-dir flatten step in case the snapshot lands inside
 one outer directory.
 
-Output layout:
+Output layout (two textures; JPEG images and ``<stem>_mask.jpg`` masks):
   <output_dir>/
-    PCB/
+    IC/  passive_component/
       anomaly_image/<TYPE>/
       mask/<TYPE>/
       clean_image/
+      cad_mask/                       one CAD mask per clean image, same stem
     defect_spec.jsonl
+    semantic_segmentation_labels.json label map for the CAD masks
 
 Usage:
   Step 1 — Authenticate with Hugging Face. Either:
@@ -113,7 +115,14 @@ def dryrun(args) -> None:
 
 
 def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(description="Download and stage the PCB defect dataset from Hugging Face.")
+    # allow_abbrev=False: argparse otherwise accepts any unambiguous abbreviation of a long option,
+    # and these scripts are launched by `usecase://<name>?<p>=...`, where the parameter names come
+    # from a config. `?output=` reached --output_dir that way and sent the dataset wherever the
+    # config said. staging/usecase.py guards its own flag too, but only the parser can close the
+    # class: a flag added here later would reopen it, and every abbreviation of it with it.
+    parser = argparse.ArgumentParser(
+        description="Download and stage the PCB defect dataset from Hugging Face.", allow_abbrev=False
+    )
     parser.add_argument("--output_dir", required=True, help="Destination directory for the prepared dataset")
     parser.add_argument("--dryrun", action="store_true", help="Show what would be downloaded without doing it")
     args = parser.parse_args(argv)

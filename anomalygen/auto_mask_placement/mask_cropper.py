@@ -17,7 +17,7 @@ class MaskCropper:
     def crop_mask_by_max_dimensions(mask: np.ndarray) -> np.ndarray:
         """Crop mask to its maximum height and width bounding box"""
         # Find bounding box of the mask
-        rows, cols = np.where(mask > 127)
+        rows, cols = np.nonzero(mask > 127)
         if len(rows) == 0 or len(cols) == 0:
             return mask
 

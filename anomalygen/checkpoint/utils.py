@@ -1,7 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Checkpoint integrity sidecars, shared by the training and inference load paths.
+"""Checkpoint integrity checks, shared by the training and inference load paths.
+
+Two things a loaded ``.pt`` cannot tell you on its own: whether its bytes are the ones we wrote
+(the digest sidecars) and whether it was trained under the recipe now being paired with it (the
+geometry stamp). The digest warns when absent and refuses a mismatch; the stamp refuses both, since
+every checkpoint this release writes carries one. A checkpoint with no stamp at all is a legacy one:
+the inference loader stamps it from its recipe in memory (:func:`upgrade_legacy_state`); a resume
+refuses it.
 
 ``weights_only=True`` stops a checkpoint executing code; it does not say the checkpoint is the one
 this run wrote. The base weights have assets/checkpoint_manifest.sha256 — this is the equivalent
@@ -18,10 +25,26 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from collections.abc import Mapping
+from typing import Optional
 
 from cosmos_framework.utils import log
 
+from anomalygen.data.crop_geometry import input_size_spec_from_config
+
 _DIGEST_SUFFIX = ".sha256"
+
+# Key holding the geometry stamp inside the saved model component. Leading underscore so it cannot
+# collide with a parameter name; both load paths pop it before the state dict reaches the model.
+GEOMETRY_STAMP_KEY = "_anomalygen_geometry"
+# Key holding the per-class input-size caps beside the stamp: dataset state, carried but never compared.
+CLASS_LADDERS_KEY = "_anomalygen_class_ladders"
+# Stamp field set by upgrade_legacy_state, so a stamp synthesised at load can be told from a trained one.
+STAMP_ORIGIN_KEY = "origin"
+LEGACY_ORIGIN = "legacy checkpoint, stamped from its recipe at load"
+# Trained parameters stacked per class (dim 0 is the class id). The framework's global LoRA is a
+# ``nn.Linear`` and ends in ``.weight``, so it is not matched.
+_CLASS_STACKED = ("lora_A", "lora_B", "text_prompt_emb")
 
 
 def _file_digest(path: str) -> str:
@@ -120,3 +143,106 @@ def verify_digest(path: str) -> None:
             "The checkpoint's bytes changed after it was written. Treat this as an integrity "
             "problem — do not re-record the digest to make it load."
         )
+
+
+def resolve_shift(model):
+    """The sampler time-shift ``model`` was built with, or ``None`` when its config carries none."""
+    config = getattr(model, "config", None)
+    shift = getattr(getattr(config, "rectified_flow_training_config", None), "shift", None)
+    return shift if isinstance(shift, (int, float)) else None
+
+
+def _config_field(dec, key: str):
+    """``key`` off a ``diffusion_expert_config`` given as an attrs object or a mapping; ``None`` if unset."""
+    return dec.get(key) if isinstance(dec, Mapping) else getattr(dec, key, None)
+
+
+def build_geometry_stamp(model) -> dict:
+    """The recipe settings the trained weights are only valid under, read off ``model.config``.
+
+    Saved beside the weights and compared on every load, so a checkpoint cannot be paired with a
+    recipe it did not train under. ``crop_ratio_range`` and ``inference_scale`` are left out: both may
+    vary at generation. Raises when the config carries no geometry: every checkpoint this pipeline
+    writes must be stamped.
+    """
+    dec = getattr(getattr(model, "config", None), "diffusion_expert_config", None)
+    shift = resolve_shift(model)
+    model_size = _config_field(dec, "model_size")
+    anomaly_types = _config_field(dec, "anomaly_types")
+    if dec is None or shift is None or model_size is None or anomaly_types is None:
+        raise ValueError(
+            "model config carries no geometry (diffusion_expert_config with model_size and anomaly_types, "
+            "plus the sampler shift); cannot stamp the checkpoint."
+        )
+    spec = input_size_spec_from_config(dec)  # the same reader generation plans with
+    return {
+        "crop_mode": spec.crop_mode,
+        "input_size_ladder": list(spec.input_size_ladder),
+        "shift": shift,
+        "model_size": str(model_size),
+        "anomaly_types": [[str(t), str(d)] for t, d in anomaly_types],
+    }
+
+
+def verify_geometry_stamp(stamp, model, source: str) -> None:
+    """Refuse ``source`` unless its stamp is complete and equal to the recipe ``model`` was built from.
+
+    No stamp, or one missing a field, means a legacy checkpoint; this verifier does not load it.
+    """
+    current = build_geometry_stamp(model)
+    if not isinstance(stamp, Mapping) or any(k not in stamp for k in current):
+        raise ValueError(
+            f"{source} carries no complete geometry stamp {list(current)}: a legacy checkpoint. It generates "
+            "with its run-dir recipe (the inference loader stamps it at load) but cannot be resumed."
+        )
+    diffs = [k for k in current if stamp[k] != current[k]]
+    if diffs:
+        detail = "; ".join(f"{k}: checkpoint {stamp[k]!r} vs recipe {current[k]!r}" for k in diffs)
+        raise ValueError(
+            f"{source} was trained under a different recipe — {detail}. Pass the recipe it trained under "
+            "(the run-dir copy)."
+        )
+
+
+def pop_and_verify_geometry_stamp(state: dict, model, source: str) -> Optional[dict]:
+    """Take the stamp and the per-class caps out of a loaded model state (neither is a parameter), check
+    the stamp against ``model``, and return the caps, or ``None`` when the checkpoint carries none.
+
+    The caller decides what to do with the caps: generation attaches them; a resume keeps its own dataset's.
+    """
+    verify_geometry_stamp(state.pop(GEOMETRY_STAMP_KEY, None), model, source)
+    caps = state.pop(CLASS_LADDERS_KEY, None)
+    return {str(k): list(v) for k, v in caps.items()} if caps else None
+
+
+def upgrade_legacy_state(state: dict, model, recipe_anomaly_types, source: str) -> None:
+    """Give an unstamped (legacy) trained-subset state the stamp and class order the current code expects.
+
+    A legacy checkpoint carries no stamp, so the recipe ``model`` was built from supplies the
+    geometry. Its class ids follow ``recipe_anomaly_types``, the order its recipe listed them in; the
+    current builder sorts them, so every class-stacked tensor is reordered to match. In memory only:
+    the file on disk is left as it is.
+    """
+    if GEOMETRY_STAMP_KEY in state:
+        raise ValueError(f"{source} is stamped; only a legacy (unstamped) checkpoint is upgraded.")
+    stamp = build_geometry_stamp(model)
+    recipe_order = [[str(t), str(d)] for t, d in recipe_anomaly_types]
+    if sorted(recipe_order) != stamp["anomaly_types"]:
+        raise ValueError(
+            f"{source}: the recipe lists anomaly_types {recipe_order}, but the model was built with "
+            f"{stamp['anomaly_types']}; pass the recipe the checkpoint trained under."
+        )
+    perm = [recipe_order.index(pair) for pair in stamp["anomaly_types"]]  # sorted id -> listed id
+    identity = perm == list(range(len(perm)))
+    for key, value in list(state.items()):
+        if key.rsplit(".", 1)[-1] not in _CLASS_STACKED:
+            continue
+        if value.shape[0] != len(perm):
+            raise ValueError(f"{source}: {key} holds {value.shape[0]} classes, the recipe lists {len(perm)}.")
+        if not identity:
+            state[key] = value[perm]
+    if not identity:
+        log.warning(
+            f"{source}: classes reordered from the recipe's listing to sorted order (sorted id -> listed id {perm})."
+        )
+    state[GEOMETRY_STAMP_KEY] = {**stamp, STAMP_ORIGIN_KEY: LEGACY_ORIGIN}

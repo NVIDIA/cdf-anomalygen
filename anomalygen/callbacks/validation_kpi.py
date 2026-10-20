@@ -21,7 +21,7 @@ from cosmos_framework.utils import distributed, log
 from cosmos_framework.utils.callback import Callback
 from PIL import Image
 
-from anomalygen.data.utils import list_image_mask_pairs
+from anomalygen.data.utils import list_image_mask_pairs, require_same_size
 from anomalygen.eval.anomaly_quality import compute_anomaly_quality_kpi
 from anomalygen.eval.correspondence import (
     DEFAULT_BACKBONE,
@@ -295,6 +295,7 @@ class ValidationKPI(Callback):
                     continue
                 rimg = Image.open(img_path).convert("RGB")
                 rmask = Image.open(mask_path).convert("L")
+                require_same_size(rimg, rmask, f"{img_path} + {mask_path}")
                 _save(rimg, out_dir, "original_image", f"real_{name}_{idx:05d}.png")
                 _save(rmask, out_dir, "original_mask", f"real_{name}_{idx:05d}.png")
                 imgs.append(_img_to_float(rimg))

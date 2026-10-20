@@ -1,0 +1,106 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example config for `python -m anomalygen.scripts.run_pipeline --config <this>` where the DATASET
+# IS PREPARED BY THE RUN. Same keys as example.yaml -- read that file for what each one does; this
+# one shows the shape a config takes when it names its own inputs rather than being handed them.
+#
+# THIS ONE RUNS AS WRITTEN, which no other example here does: `python -m
+# anomalygen.scripts.run_pipeline --config ag_config/pipeline/example_usecase.yaml`, with HF_TOKEN in
+# the environment (the PCB dataset is a gated Hugging Face repo) and nothing else on disk.
+#
+# That is why `stages` stops at `amp` and `checkpoint` is null: mask placement needs no model and no
+# GPU, so the whole run is a download and a few seconds of CPU. Add `generate, export` and a
+# fine-tuned `checkpoint` when you have one -- those are the only two edits between this file and a
+# run that produces images.
+#
+# WHAT A USE-CASE IS
+# A name, resolved against the scripts this IMAGE ships under anomalygen/scripts/datasets/ -- never
+# a path. Available here: pcb, magnetic_tile, phone_screen. The script downloads from wherever that
+# dataset really lives (a Hugging Face repo, a pinned GitHub archive) and writes the Step 1 layout;
+# `fetch` then lands what it produced on `input` like any other source, so it overlays and merges
+# with the rest of them.
+#
+# PARAMETERS, FOR A DATASET THAT CANNOT BE FULLY DOWNLOADED
+# `usecase://<name>?<p>=<source>` hands the script a file, fetched first and passed as `--<p> <path>`;
+# a bare `?<flag>` is passed through as `--<flag>`. phone_screen is the one that needs this: its
+# masks come from Hugging Face, but its images are a Roboflow COCO export somebody downloads through
+# a browser once and puts in a bucket. Without it the script refuses rather than writing a dataset
+# with no images in it:
+#
+#     input:
+#       - usecase://phone_screen?zip=s3://my-bucket/datasets/mobile-screen-coco.zip
+#       - usecase://phone_screen?masks_only     # the mask-only tree, asked for on purpose
+#
+# INPUT_OVERRIDE, FOR "GENERATE ON THESE BOARDS"
+# A prepared dataset carries the clean images its author shipped. Listing your own beside them does
+# not help -- they are merged, and AMP samples the whole pool. So `input_override` REPLACES the path
+# it names. The keys below name FILES, which keeps each dataset stem and therefore its cad_mask: the
+# key supplies the name, the source supplies the bytes. A key may equally name a directory
+# (`passive_component/clean_image`), which replaces the pool wholesale -- for a `cad` texture that
+# means supplying `cad_mask` too, with stems that match.
+
+# ── required ──────────────────────────────────────────────────────────────────
+input:  datasets/pcb_usecase                      # does not exist yet: prepare writes it
+output: results/pcb_usecase_run
+recipe: ag_config/exp_texture_ft_pcb.yaml
+checkpoint: null                                  # required once `generate` or `refine` is added
+
+# ── what to generate ──────────────────────────────────────────────────────────
+num_sdg: 6
+per_defect_counts: {IC+bridge: 2, passive_component+excess_solder: 2, passive_component+missing: 2}
+mode: inference
+amp_per_clean_pairing: off
+
+# ── sampling ──────────────────────────────────────────────────────────────────
+guidance: 3.0
+num_steps: 35
+crop_ratio: 2.0
+
+# ── seeds (see example.yaml -- the two are different axes, and a fan-out must vary BOTH) ──────────
+amp_seed: 42
+base_seed: 1
+
+# ── execution ─────────────────────────────────────────────────────────────────
+num_gpus: 1
+num_search_run: 3
+guardrail: true
+base_checkpoint: null
+
+# Six outputs over five clean images means one is claimed twice, which `source` naming refuses --
+# read once `generate` and `export` are added.
+output_naming: indexed
+
+# ── mask backend: amg (unused here; `stages` selects amp) ─────────────────────
+amg_gen_model: null
+amg_judge_model: null
+amg_model_registry: null
+amg_serve: null
+amg_cache_dir: null
+amg_beam_multi: 0
+amg_beam_pairwise: false
+amg_exemplar_captions: false
+amg_exemplar_visual_prompt: false
+amg_coverage_note: false
+
+# ── object storage ────────────────────────────────────────────────────────────
+# NEVER PUT A CREDENTIAL HERE -- the resolved config is written into <output>. HF_TOKEN and the AWS
+# chain are read from the environment; see example.yaml.
+staging:
+  fetch:
+    input:
+      - usecase://pcb                     # prepared, not downloaded: runs the shipped script
+      # - /mnt/my_corrections             # ... and overlays like any other source, later winning
+    input_override:
+      # <path inside input>  <-  where the bytes come from
+      passive_component/clean_image/C225@1_SolderLight_Missing.jpg:
+        - hf://datasets/nvidia/Spark-AnomalyGen-USD@0bbac7b7322afcfa0d58c837c17fddaee84d9b76/input_real_image/0603_H100.jpg
+      IC/clean_image/690-2G133-0210-000BOT_U23@1_SolderLight.jpg:
+        - hf://datasets/nvidia/Spark-AnomalyGen-USD@0bbac7b7322afcfa0d58c837c17fddaee84d9b76/input_real_image/115_2819_000.jpg
+  # publish:
+  #   output: s3://my-bucket/anomalygen/results/
+
+# ── stages ────────────────────────────────────────────────────────────────────
+# `prepare` is what runs the use-case, so it cannot be dropped from a config that names one -- with
+# it absent the run silently uses whatever is already at `input`, which the loader warns about.
+stages: [prepare, amp]

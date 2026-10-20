@@ -15,9 +15,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Physical AI Data Factory (PAIDF) AnomalyGen
+# Cosmos Data Factory (CDF) AnomalyGen
 
-PAIDF AnomalyGen is a diffusion-based pipeline for **Synthetic Data Generation (SDG)** of anomaly
+CDF AnomalyGen is a diffusion-based pipeline for **Synthetic Data Generation (SDG)** of anomaly
 images in a few-shot scenario. It adapts the base Cosmos generator into an **anomaly-generation**
 model for *your* defect types: given a clean product image and a mask marking where a defect
 should go, the fine-tuned model paints a realistic defect of the requested type into that region.
@@ -32,15 +32,21 @@ segmenters.
 
 1. **Dataset preparation** — turn an upstream source into the `anomaly_image/` + `mask/` +
    `clean_image/` layout the trainer expects.
-2. **Auto mask placement (AMP)** — decide where each defect goes and place its mask on the clean
-   images, building the `testcase.jsonl` that fine-tuning and generation consume.
+2. **Mask generation** — build the `testcase.jsonl` of placed defect masks that fine-tuning and
+   generation consume. The default is [Agentic Mask Generation (AMG)](docs/tutorial/texture/3-agentic-mask-generation.md): a
+   self-hostable propose→judge→refine VLM loop that authors a judged mask per clean image. The
+   classic **Auto Mask Placement (AMP)** route places training submasks by declared routing and
+   remains available.
 3. **Fine-tuning** — train the model on the `anomaly_image/` + `mask/` pairs.
 4. **Generation (SDG)** — run the fine-tuned checkpoint over a batch of testcases to synthesize
    defect images.
-5. **Evaluation** — score the batch against real references with the KPI. Optionally filter it into
-   a clean `keep/` set.
+5. **Evaluation** — score the batch against real references with the KPI.
 6. **Quality refinement** — search per-sample generation parameters over repeated
-   draw → generate → evaluate rounds, then keep the best variant of each sample.
+   draw → generate → evaluate rounds, then keep the best variant of each sample. NN is the default
+   objective; optional `aq_rank` cumulatively re-ranks NN, completeness, precision, and boundary IoU
+   over the observed candidate pool. See the
+   [refinement tutorial](docs/tutorial/texture/6-evaluation-and-refinement.md#quality-refinement-optional).
+   Optionally filter the refined batch into a clean `keep/` set.
 7. **Pseudo-labeling** — turn the refined batch into a labeled dataset: a COCO instance dataset, a
    per-class classification layout, and optional captions.
 
@@ -64,8 +70,8 @@ the defect painted into the masked region.
 ### Get the source
 
 ```shell
-git clone https://github.com/NVIDIA/paidf-anomalygen.git
-cd paidf-anomalygen
+git clone https://github.com/NVIDIA/cdf-anomalygen.git
+cd cdf-anomalygen
 ```
 
 ### Virtual environment
@@ -95,18 +101,29 @@ bash scripts/download_checkpoints.sh
 scripts/preflight_env_ckpt.sh   # GPU, Python, CUDA/torch, deps, HF auth, checkpoints
 ```
 
+That fetches every checkpoint (≈ 140 GB under `checkpoints/`, ≈ 60 GB of it the Gemma VLM for
+self-hosted mask generation), which is what a full checkout needs. A run that only ever uses some of
+them can name the groups instead — `scripts/download_checkpoints.sh --list` prints
+them, and `scripts/download_checkpoints.sh base-edge wan-vae edge-processor guardrail` is what an
+`edge` generation run opens:
+
+```shell
+bash scripts/download_checkpoints.sh --list
+```
+
 ### Docker
 
 A prebuilt image is published publicly on
-[NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/paidf-anomalygen) — no registry
+[NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cdf-anomalygen) — no registry
 login required:
 
 ```shell
-docker pull nvcr.io/nvidia/paidf-anomalygen:1.1.0
+docker pull nvcr.io/nvidia/cdf-anomalygen:1.2.0
 ```
 
-The tag tracks this repo's `VERSION`. If it is not yet on the
-[tag list](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/paidf-anomalygen/tags), that version
+The tag tracks this repo's `VERSION`. If the pull fails (*manifest unknown*, *not found* or
+*pull access denied*) or the tag is not yet on the
+[tag list](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cdf-anomalygen/tags), that version
 has not been released yet — **build the image from this checkout rather than pulling an older tag**.
 
 Building — including the `develop` / `product` / air-gapped targets — is covered in
@@ -123,10 +140,13 @@ build and sets up the environment (venv or Docker, checkpoints, smoke test). The
 
 1. [Overview & Environment Setup](docs/tutorial/texture/1-overview.md) — install and smoke test.
 2. [Dataset Preparation](docs/tutorial/texture/2-dataset-preparation.md) — build the dataset layout.
-3. [Auto Mask Placement](docs/tutorial/texture/3-auto-mask-placement.md) — place defect masks to build the testcases.
+3. [Agentic Mask Generation](docs/tutorial/texture/3-agentic-mask-generation.md) — author judged defect
+   masks to build the testcases (or classic
+   [Auto Mask Placement](docs/tutorial/texture/3-auto-mask-placement.md)).
 4. [Fine-tuning](docs/tutorial/texture/4-fine-tuning.md) — train the per-defect-type LoRAs.
 5. [Generation](docs/tutorial/texture/5-generation.md) — generate synthetic anomalies from the fine-tuned checkpoint.
-6. [Evaluation, Refinement & Pseudo-labeling](docs/tutorial/texture/6-evaluation-and-refinement.md) — evaluate, filter, refine & pseudo-label.
+6. [Evaluation, Refinement & Pseudo-labeling](docs/tutorial/texture/6-evaluation-and-refinement.md) — evaluate, refine, filter & pseudo-label.
+7. [Agentic End-to-End Flow](docs/tutorial/texture/7-agentic-end-to-end-flow.md) — run all seven stages from one prompt with the agent skill.
 
 ### Agent skills
 
@@ -145,7 +165,8 @@ validation_iter=1000
 save_iter=1000
 ```
 
-That runs all seven stages above. For a single stage, switch `mode` — e.g. `mode=generation_only`
+That runs all seven stages above; [7-agentic-end-to-end-flow.md](docs/tutorial/texture/7-agentic-end-to-end-flow.md)
+walks through it. For a single stage, switch `mode` — e.g. `mode=generation_only`
 with a `checkpoint=` and `recipe=` from an earlier run generates more images without retraining.
 
 ## Contributing

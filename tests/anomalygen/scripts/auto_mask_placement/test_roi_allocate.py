@@ -186,6 +186,16 @@ def test_count_masks_counts_images_and_zero_for_missing(tmp_path):
     assert counts == {"Phone+scratch": 3, "Phone+missing": 0}
 
 
+def test_count_masks_counts_every_extension_case_insensitively(tmp_path):
+    """The submask count that weights the proportional split: png/jpg/jpeg/bmp by lower-cased suffix,
+    a non-image left out. Pinned so the shared lister cannot change a single count."""
+    d = tmp_path / "ds" / "Phone" / "mask" / "scratch"
+    for name in ("m0.png", "m1.JPG", "m2.jpeg", "m3.BMP"):
+        _write_png(d / name)
+    (d / "notes.txt").write_text("not an image")
+    assert A._count_masks(tmp_path / "ds", ["Phone+scratch"]) == {"Phone+scratch": 4}
+
+
 # ===========================================================================
 # _validate_amp_inputs preflight
 # ===========================================================================
@@ -264,3 +274,124 @@ def test_validate_cad_checks(tmp_path):
     _write_png(ds / texture / "cad_mask" / "c0.png")
     errors2 = A._validate_amp_inputs(ds, spec)
     assert any("without matching cad_mask" in e for e in errors2)
+
+
+# ===========================================================================
+# cad_tht preflight
+# ===========================================================================
+# Each check here exists because the failure it catches is otherwise silent at placement time:
+# a `cad` label file parses cleanly and yields zero joints; a misspelled defect finds no ROI rule;
+# and a clean image sized differently from its cad_mask gets resampled against a mask built at the
+# other resolution.
+THT_PALETTE = {
+    "(0, 0, 0, 0)": {"class": "BACKGROUND"},
+    "(0, 0, 0, 255)": {"class": "UNLABELLED"},
+    "(240, 4, 111, 255)": {"class": "hole"},
+    "(27, 186, 239, 255)": {"class": "pad"},
+    "(220, 179, 62, 255)": {"class": "pin"},
+}
+# The newer annotation: the lead is split into pin_tip (its face) and pin (the exposed side wall).
+TIP_PALETTE = {
+    "(0, 0, 0, 0)": {"class": "BACKGROUND"},
+    "(0, 0, 0, 255)": {"class": "UNLABELLED"},
+    "(0, 0, 255, 255)": {"class": "hole"},
+    "(0, 255, 0, 255)": {"class": "pad"},
+    "(0, 255, 255, 255)": {"class": "pin_tip"},
+    "(255, 0, 0, 255)": {"class": "pin"},
+}
+# Nothing requires a board to expose a side wall, so pin_tip alone has to be enough.
+TIP_ONLY_PALETTE = {k: v for k, v in TIP_PALETTE.items() if v["class"] != "pin"}
+
+CAD_PALETTE = {
+    "(0, 0, 0, 255)": {"class": "UNLABELLED"},
+    "(35, 198, 233, 255)": {"class": "pad"},
+    "(93, 220, 11, 255)": {"class": "capacitor"},
+    "(243, 69, 141, 255)": {"class": "solder"},
+}
+
+
+def _tht_dataset(tmp_path, *, anomaly="interrupted", palette=None, cad_size=None, clean_size=(8, 8)):
+    """A minimal cad_tht dataset; ``cad_size`` defaults to matching the clean images."""
+    texture = "SolderPin"
+    ds = tmp_path / "ds"
+    _write_png(ds / texture / "mask" / anomaly / "m0.png")
+    for i in range(2):
+        _write_png(ds / texture / "clean_image" / f"c{i}.png", np.zeros(clean_size[::-1], np.uint8))
+        _write_png(ds / texture / "cad_mask" / f"c{i}.png", np.zeros((cad_size or clean_size)[::-1], np.uint8))
+    (ds / "semantic_segmentation_labels.json").write_text(json.dumps(palette or THT_PALETTE))
+    spec = tmp_path / "defect_spec.jsonl"
+    spec.write_text(json.dumps({"defect_type": f"{texture}+{anomaly}", "spatial_dependency": "cad_tht"}) + "\n")
+    return ds, spec
+
+
+def test_cad_tht_dataset_passes_preflight(tmp_path):
+    ds, spec = _tht_dataset(tmp_path)
+    assert A._validate_amp_inputs(ds, spec) == []
+
+
+def test_cad_tht_needs_the_pad_hole_pin_classes(tmp_path):
+    """A cad_tht run against a `cad` label file parses fine and finds no joints at all."""
+    ds, spec = _tht_dataset(tmp_path, palette=CAD_PALETTE)
+    errors = A._validate_amp_inputs(ds, spec)
+    assert len(errors) == 1
+    assert "hole" in errors[0] and "pin" in errors[0] and "needs the class" in errors[0]
+
+
+@pytest.mark.parametrize("palette", [TIP_PALETTE, TIP_ONLY_PALETTE], ids=["tip-and-pin", "tip-only"])
+def test_cad_tht_accepts_either_spelling_of_the_lead(tmp_path, palette):
+    """D is the lead face, which newer annotations name pin_tip and older ones name pin. Requiring
+    both would reject the very boards this route was extended for."""
+    ds, spec = _tht_dataset(tmp_path, palette=palette)
+    assert A._validate_amp_inputs(ds, spec) == []
+
+
+def test_cad_tht_rejects_a_palette_with_no_lead_class_at_all(tmp_path):
+    """pad + hole alone leaves D empty, so `hidden` would place into nothing."""
+    ds, spec = _tht_dataset(tmp_path, palette={k: v for k, v in THT_PALETTE.items() if v["class"] != "pin"})
+    errors = A._validate_amp_inputs(ds, spec)
+    assert len(errors) == 1
+    assert "pin or pin_tip" in errors[0]
+
+
+def test_cad_tht_rejects_a_defect_outside_the_published_enum(tmp_path):
+    ds, spec = _tht_dataset(tmp_path, anomaly="not_a_tht_defect")
+    errors = A._validate_amp_inputs(ds, spec)
+    assert any("unknown cad_tht defect" in e for e in errors)
+
+
+def test_cad_tht_rejects_a_cad_mask_of_a_different_size(tmp_path):
+    """Everything downstream is built at the cad_mask's resolution."""
+    ds, spec = _tht_dataset(tmp_path, clean_size=(8, 8), cad_size=(12, 12))
+    errors = A._validate_amp_inputs(ds, spec)
+    assert any("different size" in e for e in errors)
+
+
+def test_cad_tht_still_requires_the_shared_cad_inputs(tmp_path):
+    """cad_tht reuses the cad contract, so the labels file and a per-clean cad_mask are required."""
+    ds, spec = _tht_dataset(tmp_path)
+    (ds / "semantic_segmentation_labels.json").unlink()
+    assert any("semantic_segmentation_labels.json" in e for e in A._validate_amp_inputs(ds, spec))
+
+    ds2, spec2 = _tht_dataset(tmp_path / "b")
+    (ds2 / "SolderPin" / "cad_mask" / "c1.png").unlink()
+    assert any("without matching cad_mask" in e for e in A._validate_amp_inputs(ds2, spec2))
+
+
+def test_the_cad_route_gains_no_new_errors(tmp_path):
+    """The size and enum checks are cad_tht-only; `cad`'s accepted inputs must not change."""
+    texture, anomaly = "PCB", "bridge"
+    ds = tmp_path / "ds"
+    _write_png(ds / texture / "mask" / anomaly / "m0.png")
+    for i in range(2):
+        _write_png(ds / texture / "clean_image" / f"c{i}.png", np.zeros((8, 8), np.uint8))
+        _write_png(ds / texture / "cad_mask" / f"c{i}.png", np.zeros((12, 12), np.uint8))  # different size
+    (ds / "semantic_segmentation_labels.json").write_text(json.dumps(CAD_PALETTE))  # no hole/pin
+    spec = tmp_path / "defect_spec.jsonl"
+    spec.write_text(json.dumps({"defect_type": f"{texture}+{anomaly}", "spatial_dependency": "cad"}) + "\n")
+    assert A._validate_amp_inputs(ds, spec) == []
+
+
+def test_cad_tht_is_an_accepted_spatial_dependency(tmp_path):
+    """It used to be rejected as unknown — that rejection was the whole baseline for this work."""
+    ds, spec = _tht_dataset(tmp_path)
+    assert not any("unknown spatial_dependency" in e for e in A._validate_amp_inputs(ds, spec))

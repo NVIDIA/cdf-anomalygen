@@ -27,9 +27,26 @@ Record schema (consumed by roi_place)::
      "defect_type":     "TEXTURE+ANOMALY",
      "submask":         <path to training mask>,
      "name":            "<clean_stem>__<submask_stem>",
-     "cad_mask":        <path>  if spatial_dependency=="cad" else null,
-     "cad_mask_label":  <path>  if spatial_dependency=="cad" else null,
+     "cad_mask":        <path>  if spatial_dependency in ("cad", "cad_tht") else null,
+     "cad_mask_label":  <path>  if spatial_dependency in ("cad", "cad_tht") else null,
      "n_seeds":         <int>   placements for THIS record}
+
+PER-CLEAN PAIRING (``--per_clean_pairing``)
+
+The round-robin above maximises (submask, clean) diversity, which is the right goal when clean images
+are a reusable pool of backdrops. It does **not** cover every clean image, and the shortfall is
+invisible: ``clean_idx = (i % S + i // S) % C`` depends only on the SUM of the two indices, so B
+rounds over S submasks reach ``B + S - 1`` distinct cleans rather than ``B × S``. Measured: 200 cleans,
+a 5-mask bank and ``num_sdg=200`` produce 200 records covering **44** cleans, some used five times,
+and the log still reports "wrote 200 records". Coverage is worst near ``S = sqrt(num_sdg)``, so
+collecting more base masks makes it worse.
+
+When each clean image is a work item rather than a backdrop -- a joint crop that must be composited
+back onto a board -- the required invariant is the other one: every clean used exactly once.
+``--per_clean_pairing on`` switches to ``clean_idx = i``, ``submask_idx = i % S``.
+
+Which of the two a run needs follows from what the clean images ARE, not from any defect's
+``spatial_dependency``, so it is stated by the caller and applies to every type in the run.
 
 ``<output_pair_path>.n_seeds`` holds ``max_d n_seeds[d]`` — an upper bound for ``roi_place --n_seeds``,
 which prefers each record's own value. The ``--allocation`` JSON ({defect_type: count}) comes from
@@ -54,22 +71,15 @@ import random
 
 from cosmos_framework.utils import log
 
-_IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp"}
-
-
-def _images(d):
-    d = pathlib.Path(d)
-    if not d.is_dir():
-        return []
-    return sorted(p for p in d.iterdir() if p.suffix.lower() in _IMG_EXTS)
+from anomalygen.data.utils import list_images
 
 
 def _clean_pool(clean_dir, texture):
     nested = clean_dir / texture / "clean_image"
     if nested.is_dir():
-        return _images(nested)
+        return list_images(nested)
     tex = clean_dir / texture
-    return _images(tex) if tex.is_dir() else _images(clean_dir)
+    return list_images(tex) if tex.is_dir() else list_images(clean_dir)
 
 
 def main(argv=None):
@@ -85,6 +95,14 @@ def main(argv=None):
         "n_seeds is written to <output_pair_path>.n_seeds alongside it.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed for per-defect submask/clean shuffles.")
+    parser.add_argument(
+        "--per_clean_pairing",
+        choices=["on", "off"],
+        default="off",
+        help="on: one record per clean image, so every clean is used exactly once — requires exactly "
+        "one defect type to hold a non-zero allocation. off (default): round-robin, which maximises "
+        "(submask, clean) diversity but does NOT cover every clean image.",
+    )
     args = parser.parse_args(argv)
 
     entries = [json.loads(line) for line in args.defect_desc.read_text().splitlines() if line.strip()]
@@ -102,7 +120,7 @@ def main(argv=None):
         if n == 0:
             continue
 
-        submasks = _images(args.dataset_dir / texture / "mask" / anomaly)
+        submasks = list_images(args.dataset_dir / texture / "mask" / anomaly)
         if not submasks:
             log.warning(f"no submasks for {full}")
             continue
@@ -121,9 +139,32 @@ def main(argv=None):
         pair_budget = len(submasks) * len(clean_imgs)
         n_seeds_by_type[full] = max(1, math.ceil(allocation[full] / pair_budget)) if pair_budget else 1
 
+    # Every type or none. Pairing answers "what are the clean images" -- a pool of backdrops or a list
+    # of work items -- which is a property of the run, not of a defect's placement route, so it is not
+    # inferred from spatial_dependency.
+    per_clean = set(pools) if args.per_clean_pairing == "on" else set()
+
+    if per_clean:
+        # One record per clean means one defect per clean, so two types would both claim the same
+        # images. Rather than partition the pool and make the split a hidden rule, require the caller
+        # to name the single type — the composite-back-onto-the-board flow generates one class at a
+        # time anyway.
+        requested = sorted(t for t, n in allocation.items() if n)
+        if len(requested) != 1:
+            raise SystemExit(
+                "--per_clean_pairing=on needs exactly one defect type with a "
+                f"non-zero allocation, got {len(requested)}: {requested}. Select one with "
+                f"roi_allocate --per_defect_counts '{{\"{requested[0] if requested else 'TEXTURE+ANOMALY'}\": N}}', "
+                "or pass --per_clean_pairing off to use the diversity pairing (correct for a "
+                "validation set, which needs every type scored rather than every clean covered)."
+            )
+        for full in per_clean:
+            # Each clean is used once, so AMP multi-placement per record has nothing to make up.
+            n_seeds_by_type[full] = 1
+
     # Pass 2: emit records — iterate every (submask, clean) pair.
     def _cad_fields(sd, texture, clean_img):
-        if sd != "cad":
+        if sd not in ("cad", "cad_tht"):
             return None, None
         cad_mask_path = args.dataset_dir / texture / "cad_mask" / f"{clean_img.stem}.png"
         if not cad_mask_path.exists():
@@ -147,11 +188,31 @@ def main(argv=None):
         # ⌈alloc/n_seeds⌉ records of n_seeds placements each overshoots whenever n_seeds does not
         # divide the allocation, so the final record takes only the remainder. Without this a request
         # of 9 at n_seeds=2 yields 5 x 2 = 10 images — num_sdg would be a floor, not a target.
+        if full in per_clean:
+            # One record per clean image, in shuffled order, so `wc -l testcase.jsonl` and the number
+            # of distinct cleans covered are the same number.
+            n_records = allocation[full]
+            if n_records > C:
+                raise SystemExit(
+                    f"{full}: --per_clean_pairing needs one clean image per record, but the "
+                    f"allocation asks for {n_records} and only {C} clean image(s) exist. Lower "
+                    f"--num_sdg to {C}."
+                )
+            if n_records < C:
+                log.warning(
+                    f"{full}: allocation {n_records} < {C} clean image(s) — {C - n_records} will get "
+                    "no output. Set --num_sdg to the clean-image count to cover every one."
+                )
+            n_seeds = 1
+
         remainder = allocation[full] - n_seeds * (n_records - 1)
         for i in range(n_records):
             submask_idx = i % S
-            round_k = i // S
-            clean_idx = (submask_idx + round_k) % C
+            if full in per_clean:
+                clean_idx = i
+            else:
+                round_k = i // S
+                clean_idx = (submask_idx + round_k) % C
             submask = submasks[submask_idx]
             clean_img = clean_imgs[clean_idx]
             cad_mask, cad_mask_label = _cad_fields(sd, texture, clean_img)

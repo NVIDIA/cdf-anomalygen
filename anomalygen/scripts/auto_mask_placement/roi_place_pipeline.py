@@ -72,6 +72,8 @@ def _stage_argvs(args, passthrough):
         str(pairs),
         "--seed",
         str(args.seed),
+        "--per_clean_pairing",
+        args.per_clean_pairing,
     ]
     place = [
         "--input_pair_path",
@@ -101,6 +103,22 @@ def _read_n_seeds(pairs_path):
     return sidecar.read_text().strip() or "1"
 
 
+def _stage_rc(main, argv) -> int:
+    """Run one stage's ``main(argv)`` and return its exit code."""
+    try:
+        return main(argv) or 0
+    except SystemExit as exc:  # NOSONAR — a stage's exit (argparse error, sys.exit) becomes the return code
+        # A stage that exits with a MESSAGE puts it in `code` -- argparse does, and so does a
+        # stage naming what the caller has to change. Dropping it left only "stage exited 1",
+        # which is precisely the information the message existed to supply.
+        if exc.code is None:  # bare sys.exit() means success
+            return 0
+        if isinstance(exc.code, int):
+            return exc.code
+        log.error(str(exc.code))
+        return 1
+
+
 def _run(args, passthrough, stage_main=None) -> int:
     """Run the three stages. ``stage_main`` maps stage name -> ``main(argv)``; it defaults to the real
     CLIs and exists so callers (and tests) can substitute them without patching module state."""
@@ -115,10 +133,7 @@ def _run(args, passthrough, stage_main=None) -> int:
         log.info(f"{stage} {' '.join(argv)}")
         if args.dry_run:
             continue
-        try:
-            rc = stage_main[stage](argv) or 0
-        except SystemExit as exc:  # argparse errors and explicit sys.exit inside a stage
-            rc = exc.code if isinstance(exc.code, int) else 1
+        rc = _stage_rc(stage_main[stage], argv)
         if rc != 0:
             log.error(f"{stage} exited {rc} — stopping.")
             return rc
@@ -160,6 +175,14 @@ def _get_args(argv=None):
         "--per_defect_counts",
         default=None,
         help="JSON dict of explicit per-defect counts, forwarded to roi_allocate. Only valid with --mode inference.",
+    )
+    # roi_pair's flag, exposed here because the `--` passthrough reaches roi_place only.
+    parser.add_argument(
+        "--per_clean_pairing",
+        choices=["on", "off"],
+        default="off",
+        help="on: every clean image used exactly once (one defect type only). "
+        "off (default): round-robin, which does not cover every clean image.",
     )
     parser.add_argument("--dry_run", action="store_true", help="Print each stage's argv without running it.")
     args, passthrough = parser.parse_known_args(argv)

@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Import-only stub for the `pycountry` package.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycountry-stub"
+version = "0.0.0"
+description = "Import-only stub for `pycountry` so vllm's mistral-common import path loads without the LGPL package."
+
+[tool.setuptools]
+packages = ["pycountry"]

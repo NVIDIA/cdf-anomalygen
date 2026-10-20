@@ -140,7 +140,7 @@ def _clusters(core: np.ndarray, mask_bool: np.ndarray):
     for i in range(1, n + 1):
         g = lab == i
         if (g & core).sum() >= thr:
-            ys, xs = np.where(g)
+            ys, xs = np.nonzero(g)
             boxes.append([int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())])
     return boxes
 
@@ -191,7 +191,7 @@ def completeness(
     if at == 0:
         return float("nan"), np.zeros(mask_bool.shape, dtype=bool)
     core, diff, t = _extract_core(clean255, gen255)
-    ys, xs = np.where(mask_bool)
+    ys, xs = np.nonzero(mask_bool)
     whole_box = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
     cluster_boxes = _clusters(core, mask_bool)
     sam = _sam_segment_boxes(gen255, np.asarray([whole_box] + cluster_boxes, np.float32), predictor)
@@ -320,7 +320,7 @@ def compute_anomaly_quality_kpi(
             nn_vals.append(float("nan") if failed else _aq_nn_score(sample))
             for a in _AXES:
                 axis_vals[a].append(_to_float(sample.get(a)))
-            # Per-sample axes for downstream rankers (e.g. the offline filter's aq_rank_score). Kept
+            # Per-sample axes for downstream rankers (filtering and cumulative AQ-Rank refinement). Kept
             # under a distinct key from correspondence's ``per_sample`` so ValidationKPI's
             # ``kpi[name].update(vals)`` merge never clobbers the nn/mnn per-sample rows.
             sample_rows.append({"path": path, **{a: _to_float(sample.get(a)) for a in _AXES}})
@@ -368,7 +368,7 @@ _COMPASS_PCT = 0.20  # top/bottom fraction of nn used as pseudo good/bad to orie
 # axes but, fit from only 2*k pseudo-labels, does NOT reliably reject a noisy one (a pure-noise axis
 # passes well above chance). A significance-test gate (Mann-Whitney p-value) is planned follow-up.
 _COMPASS_GATE = 0.05
-_COMPASS_MIN_N = 5  # fewer samples than this per type: skip the compass, rank on nn alone
+COMPASS_MIN_N = 5  # fewer samples than this per type: skip the compass, rank on nn alone
 
 
 def _rank01(values: Sequence) -> np.ndarray:
@@ -402,20 +402,27 @@ def compute_aq_rank_scores(rows: List[dict]) -> np.ndarray:
     composite may carry weak terms (a Mann-Whitney significance gate is planned — see the module
     docstring). No ground-truth labels are used — the sign is self-supervised from ``nn``. Samples with
     a NaN ``nn`` (degenerate, no defect features) are forced last so they drop first, matching the
-    plain-nn path. With fewer than ``_COMPASS_MIN_N`` samples the direction is unreliable, so rank on
+    plain-nn path. With fewer than ``COMPASS_MIN_N`` samples the direction is unreliable, so rank on
     ``nn`` alone.
 
-    This is a **rank-relative, filter-time** score, not a validation metric: it ranks samples *within*
-    one batch, so ``mean(rank01(x)) == 0.5`` for any batch. Do NOT register it in ``METRIC_SPECS`` /
-    early-stop — a per-pass-relative score can't track training across passes (the same trap that made
-    the old z-scored composite unusable). The absolute, cross-pass ``aq_nn`` is the composite for that.
-    Living in this module does not change that: it is here because ``augment_with_quality`` writes it.
+    This is a **rank-relative candidate-pool** score, not a validation metric: filtering ranks one
+    bucket, while quality refinement re-ranks Original plus the observed rounds before every draw and
+    over the full pool for final selection. ``mean(rank01(x)) == 0.5`` for any pool, so do NOT register
+    it in ``METRIC_SPECS`` / early-stop — a pass-relative score cannot track training across passes
+    (the same trap that made the old z-scored composite unusable). The absolute, cross-pass ``aq_nn``
+    is the composite for that. Living in this module keeps both consumers on the same implementation.
     """
+    return compute_aq_rank_with_compass(rows)[0]
+
+
+def compute_aq_rank_with_compass(rows: List[dict]) -> tuple[np.ndarray, dict]:
+    """As :func:`compute_aq_rank_scores`, plus each axis's fitted ``auroc`` and ``sign`` for audit logs."""
     nn = np.array([_to_float(r.get("nn_score")) for r in rows], dtype=float)
     n = len(nn)
     nan_nn = np.isnan(nn)
     score = _rank01(nn)
-    if n >= _COMPASS_MIN_N:
+    axes = {axis: {"auroc": None, "sign": 0} for axis in _AXES}
+    if n >= COMPASS_MIN_N:
         order = np.argsort(np.where(nan_nn, -np.inf, nn))
         k = max(2, int(n * _COMPASS_PCT))
         pseudo_good = set(order[-k:].tolist())
@@ -425,9 +432,11 @@ def compute_aq_rank_scores(rows: List[dict]) -> np.ndarray:
         for axis in _AXES:
             ranked = _rank01([r.get(f"{axis}_score") for r in rows])
             auc = _auroc(ranked[idx], labels)
-            if auc is not None and abs(auc - 0.5) >= _COMPASS_GATE:
-                score = score + (1.0 if auc >= 0.5 else -1.0) * ranked
-    return np.where(nan_nn, -np.inf, score)
+            sign = 0 if auc is None or abs(auc - 0.5) < _COMPASS_GATE else (1 if auc >= 0.5 else -1)
+            axes[axis] = {"auroc": auc, "sign": sign}
+            if sign:
+                score = score + sign * ranked
+    return np.where(nan_nn, -np.inf, score), {"pool_size": n, "axes": axes}
 
 
 def augment_with_quality(kpi: Dict, aq_kpi: Dict) -> None:

@@ -61,7 +61,7 @@ staging:
     input:
       - usecase://magnetic_tile       # magnetic_tile's shipped prepare script: pulls the public GitHub dataset into the Step 1 layout
   publish:
-    output: s3://sdg-workflow-controller-output/generated/defect_image_generation/day1/magnetic_tile/   # DEPLOYMENT: the bucket and prefix root; nothing per request: the tail is day1/<usecase>/ and ends there
+    output: s3://sdg/generated/defect_image_generation/day1/magnetic_tile/   # DEPLOYMENT: the bucket and prefix root; nothing per request: the tail is day1/<usecase>/ and ends there
 
 # ── stages (fixed) ────────────────────────────────────────────────────────────
 stages: [prepare, amg, generate, export, publish]

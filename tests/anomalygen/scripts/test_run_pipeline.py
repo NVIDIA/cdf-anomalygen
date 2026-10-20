@@ -1307,7 +1307,7 @@ def test_every_template_has_the_shape_the_request_doc_promises(template):
         assert set(counts) == _trained_pairs(cfg["recipe"])
     # One publish rule (the guide, "One publish rule"): <root>/<day>/<usecase>/, then for pcb alone
     # <component>/<defect>/ -- the two things a pcb request names. Pinned exactly, not by prefix.
-    root = "s3://sdg-workflow-controller-output/generated/defect_image_generation/"
+    root = "s3://sdg/generated/defect_image_generation/"
     tail = f"{day}/{uc}/"
     if uc == "pcb":
         rest = template.stem[len(f"pcb_{day}_") :]

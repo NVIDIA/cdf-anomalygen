@@ -48,7 +48,7 @@ staging:
       IC/clean_image:              # CHANGES PER REQUEST: Decision 1 -- the whole clean_image/ of that texture
         - <hf:// or s3:// URL of the attached image>   # CHANGES PER REQUEST: the attached real image, kept under its own name
   publish:
-    output: s3://sdg-workflow-controller-output/generated/defect_image_generation/day1/pcb/<component>/bridge/   # DEPLOYMENT: the bucket and prefix root; CHANGES PER REQUEST: the <component>/<defect>/ tail after day1/pcb/
+    output: s3://sdg/generated/defect_image_generation/day1/pcb/<component>/bridge/   # DEPLOYMENT: the bucket and prefix root; CHANGES PER REQUEST: the <component>/<defect>/ tail after day1/pcb/
 
 # ── stages (fixed) ────────────────────────────────────────────────────────────
 stages: [prepare, amg, generate, export, publish]

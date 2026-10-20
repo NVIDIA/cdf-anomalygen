@@ -54,9 +54,9 @@ staging:
       - usecase://pcb                 # pcb's shipped prepare script: pulls nvidia/Cosmos-AnomalyGen-PCB-Dataset into the Step 1 layout
     input_override:                   # paths INSIDE input that are REPLACED by the sources listed for them
       passive_component/clean_image: # CHANGES PER REQUEST: Decision 1 -- the whole clean_image/ of that texture
-        - s3://sdg-workflow-controller-output/generated/defect_image_generation/runs/<run>/augment/<component>/passive_component/   # DEPLOYMENT: the prefix the upstream augment task writes; CHANGES PER REQUEST: its run/component part
+        - s3://sdg/generated/defect_image_generation/runs/<run>/augment/<component>/passive_component/   # DEPLOYMENT: the prefix the upstream augment task writes; CHANGES PER REQUEST: its run/component part
   publish:
-    output: s3://sdg-workflow-controller-output/generated/defect_image_generation/day0/pcb/<component>/excess_solder/   # DEPLOYMENT: the bucket and prefix root; CHANGES PER REQUEST: the <component>/<defect>/ tail after day0/pcb/
+    output: s3://sdg/generated/defect_image_generation/day0/pcb/<component>/excess_solder/   # DEPLOYMENT: the bucket and prefix root; CHANGES PER REQUEST: the <component>/<defect>/ tail after day0/pcb/
 
 # ── stages (fixed) ────────────────────────────────────────────────────────────
 stages: [prepare, amg, generate, export, publish]

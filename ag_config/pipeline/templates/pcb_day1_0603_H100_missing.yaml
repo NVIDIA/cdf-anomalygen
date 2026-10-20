@@ -48,7 +48,7 @@ staging:
       passive_component/clean_image: # CHANGES PER REQUEST: Decision 1 -- the whole clean_image/ of that texture
         - hf://datasets/nvidia/Spark-AnomalyGen-USD@0bbac7b7322afcfa0d58c837c17fddaee84d9b76/input_real_image/0603_H100.jpg   # CHANGES PER REQUEST: the attached real image, kept under its own name
   publish:
-    output: s3://sdg-workflow-controller-output/generated/defect_image_generation/day1/pcb/0603_H100/missing/   # DEPLOYMENT: the bucket and prefix root; CHANGES PER REQUEST: the <component>/<defect>/ tail after day1/pcb/
+    output: s3://sdg/generated/defect_image_generation/day1/pcb/0603_H100/missing/   # DEPLOYMENT: the bucket and prefix root; CHANGES PER REQUEST: the <component>/<defect>/ tail after day1/pcb/
 
 # ── stages (fixed) ────────────────────────────────────────────────────────────
 stages: [prepare, amg, generate, export, publish]

@@ -48,9 +48,9 @@ amg_cache_dir: /work/amg_cache/phone_screen                # DEPLOYMENT: a writa
 staging:
   fetch:
     input:
-      - usecase://phone_screen?zip=s3://sdg-workflow-controller-input/datasets/mobile-screen-coco.zip   # DEPLOYMENT: the Roboflow COCO export, downloaded once by a person and kept in a bucket the pod reads
+      - usecase://phone_screen?zip=s3://sdg/datasets/mobile-screen-coco.zip   # DEPLOYMENT: the Roboflow COCO export, downloaded once by a person and kept in a bucket the pod reads
   publish:
-    output: s3://sdg-workflow-controller-output/generated/defect_image_generation/day1/phone_screen/   # DEPLOYMENT: the bucket and prefix root; nothing per request: the tail is day1/<usecase>/ and ends there
+    output: s3://sdg/generated/defect_image_generation/day1/phone_screen/   # DEPLOYMENT: the bucket and prefix root; nothing per request: the tail is day1/<usecase>/ and ends there
 
 # ── stages (fixed) ────────────────────────────────────────────────────────────
 stages: [prepare, amg, generate, export, publish]

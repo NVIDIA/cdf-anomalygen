@@ -97,7 +97,7 @@ UPSTREAM_LICENSE_URLS: dict[str, tuple[str, ...]] = {
         "https://raw.githubusercontent.com/QwenLM/Qwen2-VL/96588727e44c78b25ba03ea03b8e12f7e64fd0da/LICENSE",
     ),
     "sentencepiece": ("https://raw.githubusercontent.com/google/sentencepiece/v0.2.2/LICENSE",),
-    "tokenizers": ("https://raw.githubusercontent.com/huggingface/tokenizers/v0.22.2/LICENSE",),
+    "tokenizers": ("https://raw.githubusercontent.com/huggingface/tokenizers/v0.23.2/LICENSE",),
     "transformer-engine-torch": ("https://raw.githubusercontent.com/NVIDIA/TransformerEngine/v2.15/LICENSE",),
     "z3-solver": ("https://raw.githubusercontent.com/Z3Prover/z3/z3-4.15.4/LICENSE.txt",),
 }

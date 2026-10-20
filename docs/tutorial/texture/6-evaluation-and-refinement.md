@@ -181,7 +181,7 @@ rather than assembling a stale `searched/` from an unfinished round. The scoring
 are forwarded to every round's `evaluate`, so each round is scored exactly the way the batch it is
 selected against was. `run` has no resume, so repair a failed round in place rather than re-running
 `run` (which would redraw every round from 1); see the
-[quality-refinement reference](../../../skills/anomalygen/references/quality-refinement.md).
+[quality-refinement reference](../../../skills/cdf-anomalygen/references/quality-refinement.md).
 
 It also requires the generation CSV to name exactly the reconstructed images in that round. This
 check applies to every score mode because both BO history and final selection join KPI rows through

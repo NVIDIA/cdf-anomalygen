@@ -1,5 +1,5 @@
 ---
-name: anomalygen
+name: cdf-anomalygen
 description: >-
   Use when running the CDF AnomalyGen pipeline over a defect dataset — mask placement,
   fine-tuning, synthetic defect-image generation (SDG), evaluation, quality refinement, and
@@ -12,7 +12,6 @@ metadata:
   owner: NVIDIA
   service: anomaly generation
   version: 1.2.0
-  reviewed: '2026-09-03'
   author: NVIDIA <nvidia@nvidia.com>
   tags:
       - physical-ai
@@ -23,7 +22,7 @@ metadata:
   frameworks: [pytorch, cosmos, diffusion]
 ---
 
-# Skill: anomalygen
+# Skill: cdf-anomalygen
 
 ## Purpose
 

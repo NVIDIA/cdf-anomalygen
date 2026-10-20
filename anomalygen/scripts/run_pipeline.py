@@ -15,7 +15,7 @@ be skipped, so a run can resume from whatever is already on disk::
     refine    quality_refine.py           -> <output>/searched/
     export    (here)                      -> <output>/export/<clean_stem>.png
 
-The stages are the ones ``skills/anomalygen/SKILL.md`` documents as Steps 2 and 4-6; this drives
+The stages are the ones ``skills/cdf-anomalygen/SKILL.md`` documents as Steps 2 and 4-6; this drives
 them from a config file instead of six shell invocations, and adds the export step, which has no
 CLI of its own.
 

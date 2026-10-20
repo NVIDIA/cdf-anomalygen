@@ -1,4 +1,4 @@
-# Skill Benchmark: anomalygen
+# Skill Benchmark: cdf-anomalygen
 
 > ✅ **Overall verdict: PASS — Recommended for publication**
 
@@ -8,12 +8,12 @@ Recommended for publication based on the completed evaluation evidence in this r
 
 ## Evaluation Metadata
 
-- Skill: `anomalygen`
-- Evaluation date: 2026-10-08
+- Skill: `cdf-anomalygen`
+- Evaluation date: 2026-10-20
 - Evaluator version: `1.5.6`
 - Agents: Claude Code (`aws/anthropic/bedrock-claude-opus-4-8`), Codex (`openai/openai/gpt-5.5`)
 - Tasks: 5 evaluation tasks (5 positive)
-- Dataset digest: `sha256:17d86fc72cefe39a08619c7b1bec68c403d32debe3d0ad73cb4d729065ceab84` (skill-evaluator-dataset-snapshot/1)
+- Dataset digest: `sha256:70cd2d0187ec4a98b6dabaca1b4fab7c7a4aea3c53115acdcd5a15d75872cc18` (skill-evaluator-dataset-snapshot/1)
 - Attempts per task: 1
 - Environment: `k8s-sandbox`
 - Tier 2 evidence: required for publication
@@ -35,12 +35,12 @@ The three-tier evaluation checks whether the skill:
 
 | Measure | Claude Code (Baseline → Skill Uplift) | Codex (Baseline → Skill Uplift) |
 |---|---:|---:|
-| Overall | 75.2% — baseline ran, but no comparable score was available; uplift unavailable | 70.8% — baseline ran, but no comparable score was available; uplift unavailable |
-| Security | 100.0% → 100.0% (±0.0 points) | 80.0% → 100.0% (+20.0 points) |
-| Correctness | 0.0% → 64.0% (+64.0 points) | 0.0% → 48.0% (+48.0 points) |
-| Discoverability | 97.2% — baseline ran, but no comparable score was available; uplift unavailable | 92.0% — baseline ran, but no comparable score was available; uplift unavailable |
-| Effectiveness | 6.5% → 29.8% (+23.3 points) | 9.8% → 23.8% (+14.0 points) |
-| Efficiency | 84.8% — baseline ran, but no comparable score was available; uplift unavailable | 90.4% — baseline ran, but no comparable score was available; uplift unavailable |
+| Overall | 71.4% — baseline ran, but no comparable score was available; uplift unavailable | 71.1% — baseline ran, but no comparable score was available; uplift unavailable |
+| Security | 100.0% → 100.0% (±0.0 points) | 100.0% → 100.0% (±0.0 points) |
+| Correctness | 0.0% → 56.0% (+56.0 points) | 0.0% → 48.0% (+48.0 points) |
+| Discoverability | 98.0% — baseline ran, but no comparable score was available; uplift unavailable | 91.0% — baseline ran, but no comparable score was available; uplift unavailable |
+| Effectiveness | 6.5% → 17.8% (+11.3 points) | 4.5% → 20.7% (+16.2 points) |
+| Efficiency | 85.1% — baseline ran, but no comparable score was available; uplift unavailable | 95.7% — baseline ran, but no comparable score was available; uplift unavailable |
 
 **How to read this table:** baseline is the same task attempted without the target skill. Scores are rounded to one decimal; threshold-adjacent values use additional precision so their displayed band matches the verdict. Uplift is derived from those displayed scores and shown in percentage points.
 
@@ -52,19 +52,19 @@ Actual Tier 3 execution usage is reported for every observed agent/case pair and
 
 | Agent | Dataset case | With skill | Without skill | Delta | Change | Coverage |
 |---|---|---:|---:|---:|---:|---|
-| claude-code | All cases | 1,982,146 | 1,315,139 | +667,007 | +50.72% | skill 5/5; base 5/5 |
-| claude-code | 1 | 408,153 | 248,241 | +159,912 | +64.42% | skill 1/1; base 1/1 |
-| claude-code | 2 | 545,930 | 345,597 | +200,333 | +57.97% | skill 1/1; base 1/1 |
-| claude-code | 3 | 265,046 | 154,648 | +110,398 | +71.39% | skill 1/1; base 1/1 |
-| claude-code | 4 | 358,845 | 382,650 | -23,805 | -6.22% | skill 1/1; base 1/1 |
-| claude-code | 5 | 404,172 | 184,003 | +220,169 | +119.66% | skill 1/1; base 1/1 |
-| codex | All cases | 737,229 | 583,401 | +153,828 | +26.37% | skill 5/5; base 5/5 |
-| codex | 1 | 99,804 | 132,893 | -33,089 | -24.90% | skill 1/1; base 1/1 |
-| codex | 2 | 188,820 | 147,973 | +40,847 | +27.60% | skill 1/1; base 1/1 |
-| codex | 3 | 87,627 | 85,543 | +2,084 | +2.44% | skill 1/1; base 1/1 |
-| codex | 4 | 160,974 | 146,353 | +14,621 | +9.99% | skill 1/1; base 1/1 |
-| codex | 5 | 200,004 | 70,639 | +129,365 | +183.14% | skill 1/1; base 1/1 |
-| ALL AGENTS | Dataset aggregate | 2,719,375 | 1,898,540 | +820,835 | +43.24% | skill 10/10; base 10/10 |
+| claude-code | All cases | 2,081,766 | 1,772,534 | +309,232 | +17.45% | skill 5/5; base 5/5 |
+| claude-code | 1 | 310,839 | 292,125 | +18,714 | +6.41% | skill 1/1; base 1/1 |
+| claude-code | 2 | 406,507 | 379,371 | +27,136 | +7.15% | skill 1/1; base 1/1 |
+| claude-code | 3 | 358,612 | 213,331 | +145,281 | +68.10% | skill 1/1; base 1/1 |
+| claude-code | 4 | 646,836 | 703,491 | -56,655 | -8.05% | skill 1/1; base 1/1 |
+| claude-code | 5 | 358,972 | 184,216 | +174,756 | +94.86% | skill 1/1; base 1/1 |
+| codex | All cases | 852,353 | 513,367 | +338,986 | +66.03% | skill 5/5; base 5/5 |
+| codex | 1 | 134,242 | 113,129 | +21,113 | +18.66% | skill 1/1; base 1/1 |
+| codex | 2 | 279,857 | 115,590 | +164,267 | +142.11% | skill 1/1; base 1/1 |
+| codex | 3 | 141,050 | 113,490 | +27,560 | +24.28% | skill 1/1; base 1/1 |
+| codex | 4 | 227,295 | 114,234 | +113,061 | +98.97% | skill 1/1; base 1/1 |
+| codex | 5 | 69,909 | 56,924 | +12,985 | +22.81% | skill 1/1; base 1/1 |
+| ALL AGENTS | Dataset aggregate | 2,934,119 | 2,285,901 | +648,218 | +28.36% | skill 10/10; base 10/10 |
 
 Prompt tokens include cached reads, so total tokens are `prompt + completion` (cached is not added twice). The Efficiency score uses `(prompt - cached) + completion`. N/A means the relevant trajectory counters were not available; coverage is never estimated.
 
@@ -81,11 +81,11 @@ Prompt tokens include cached reads, so total tokens are `prompt + completion` (c
 <details>
 <summary>Show detailed findings and successful checks</summary>
 
-- **MEDIUM** QUALITY/quality_efficiency: Large skill (9849 tokens, recommended max <5000). Per agentskills.io, SKILL.md should be concise (~500 lines) — large skill bodies increase token cost after invocation; long or unfocused top-level descriptions can degrade agent routing accuracy (`skills/anomalygen/SKILL.md`)
-- **MEDIUM** SCHEMA/line_count: SKILL.md has 640 lines (limit: 500) (`skills/anomalygen/SKILL.md`)
-- **MEDIUM** SECURITY/Session Persistence (RA2): Rogue Agent: mkdir -p ~/.anomalygen && cp scripts/agentic_mask_generation_serving/endpoints.example.yaml ~/.anomalygen (`SKILL.md:99`)
-- **MEDIUM** SECURITY/Whitespace Padding (P9): Prompt Injection: U+0020 x117 (`SKILL.md:582`)
-- **MEDIUM** SECURITY/Whitespace Padding (P9): Prompt Injection: U+0020 x117 (`SKILL.md:639`)
+- **MEDIUM** QUALITY/quality_efficiency: Large skill (9845 tokens, recommended max <5000). Per agentskills.io, SKILL.md should be concise (~500 lines) — large skill bodies increase token cost after invocation; long or unfocused top-level descriptions can degrade agent routing accuracy (`skills/cdf-anomalygen/SKILL.md`)
+- **MEDIUM** SCHEMA/line_count: SKILL.md has 639 lines (limit: 500) (`skills/cdf-anomalygen/SKILL.md`)
+- **MEDIUM** SECURITY/Session Persistence (RA2): Rogue Agent: mkdir -p ~/.anomalygen && cp scripts/agentic_mask_generation_serving/endpoints.example.yaml ~/.anomalygen (`SKILL.md:98`)
+- **MEDIUM** SECURITY/Whitespace Padding (P9): Prompt Injection: U+0020 x117 (`SKILL.md:581`)
+- **MEDIUM** SECURITY/Whitespace Padding (P9): Prompt Injection: U+0020 x117 (`SKILL.md:638`)
 - 33 additional finding(s) are available in the full evaluation artifacts.
 
 </details>

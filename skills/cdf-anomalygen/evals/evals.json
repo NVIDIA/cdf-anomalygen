@@ -2,7 +2,7 @@
   {
     "id": "1",
     "question": "I already fine-tuned the phone_screen model — the run dir is results/anomalygen/phone_screen/train. Generate 200 synthetic defect images from dataset datasets/phone_screen.",
-    "expected_skill": "anomalygen",
+    "expected_skill": "cdf-anomalygen",
     "ground_truth": "Response locks mode=generation_only because a trained checkpoint already exists, so Step 3 is skipped. Because Step 3 is skipped, it sets CKPT and RECIPE by hand from the run dir: CKPT from checkpoints/model/$(cat ${RUN_DIR}/checkpoints/best_checkpoint.txt), and RECIPE from the run-dir copy ${RUN_DIR}/exp_${TASK}_${NAME}.yaml, noting the two must come from the same run or class ids drift. Step 4 runs generate.py with --nproc_per_node=\"${NUM_GPUS}\" expanded from the variable.",
     "expected_behavior": [
       "Response locks mode=generation_only (NOT full) because a trained checkpoint already exists.",
@@ -14,7 +14,7 @@
   {
     "id": "2",
     "question": "Fine-tune an anomaly-generation model named pcb on datasets/pcb with recipe ag_config/exp_texture_ft_pcb.yaml. Use 25 validation masks. I don't need any images generated.",
-    "expected_skill": "anomalygen",
+    "expected_skill": "cdf-anomalygen",
     "ground_truth": "Response locks mode=finetune_only, which stops after training — no generation, evaluation, refinement or pseudo-labeling. Step 3 launches through scripts/skill_utility/train_control.sh start with --num_gpus \"${NUM_GPUS}\" expanded from the variable, never a hand-rolled torchrun, which would silently discard it. It then calls train_control.sh wait in the foreground repeatedly until it stops returning 2, rather than arming a background watcher and ending the turn.",
     "expected_behavior": [
       "Response locks mode=finetune_only and stops after training without generating images.",
@@ -26,7 +26,7 @@
   {
     "id": "3",
     "question": "Run the whole AnomalyGen pipeline on my dataset at datasets/bottle and give me 50 images.",
-    "expected_skill": "anomalygen",
+    "expected_skill": "cdf-anomalygen",
     "ground_truth": "Response locks mode=full. It asks for name, which is required in every mode, rather than guessing. It does not ask for recipe, which full derives from name. It does not infer name from the dataset path. After training, it derives CKPT from best_checkpoint.txt rather than asking the user for a checkpoint.",
     "expected_behavior": [
       "Response locks mode=full.",
@@ -39,7 +39,7 @@
   {
     "id": "4",
     "question": "Fine-tune an anomaly-generation model named tile on datasets/magnetic_tile with recipe ag_config/exp_texture_ft_tile.yaml, using the legacy fixed-size mechanism. Use 25 validation masks. No generation needed.",
-    "expected_skill": "anomalygen",
+    "expected_skill": "cdf-anomalygen",
     "ground_truth": "Response locks mode=finetune_only and recognizes legacy_fixed_size from the phrase 'legacy fixed-size mechanism' without asking about it. It passes --job_name anomalygen_texture_ft_legacy to set_pipeline_vars.sh, so RUN_DIR ends in anomalygen_texture_ft_legacy and never collides with a default run of the same name. Step 3 copies the template to the recipe, edits the dataset block, sets the recipe's job_name to anomalygen_texture_ft_legacy, and appends the legacy block exactly as SKILL.md lists it — input_size_ladder [512], crop_mode ratio, crop_ratio_range [1.5, 8.0], and the three augmentation probabilities at 0.5 — all six keys, none invented or omitted. Recipe path, launcher and checkpoint selection are otherwise unchanged.",
     "expected_behavior": [
       "Response recognizes the legacy fixed-size request without asking the user to confirm the mechanism.",
@@ -51,7 +51,7 @@
   {
     "id": "5",
     "question": "Use AnomalyGen skill with\nname=bottle\nmode=full\ndataset_dir=datasets/bottle\nnum_sdg=25\nmax_iter=10000\nvalidation_iter=2000\nsave_iter=2000",
-    "expected_skill": "anomalygen",
+    "expected_skill": "cdf-anomalygen",
     "ground_truth": "Response locks mode=full and does not ask for recipe, which full derives from name. In Step 3 it edits the recipe to max_iter: 10000, validation_iter: 2000 and save_iter: 2000, and also sets cycle_lengths: 10000, because cycle_lengths is the learning-rate schedule length and must equal max_iter.",
     "expected_behavior": [
       "Response locks mode=full and does not ask for recipe.",

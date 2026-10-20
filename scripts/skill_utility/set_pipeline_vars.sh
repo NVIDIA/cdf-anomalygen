@@ -17,7 +17,7 @@
 # Re-source it in every shell that needs the variables. Sourcing is idempotent and cheap (no I/O), and
 # a fresh shell — a new terminal, a new tool call, a new CI step — does not inherit them.
 #
-# Options (defaults match the Inputs table in skills/anomalygen/SKILL.md):
+# Options (defaults match the Inputs table in skills/cdf-anomalygen/SKILL.md):
 #   --name             required  EXPERIMENT LABEL ONLY. It names the recipe, the run dir, the logs and
 #                      the derived validation_*/generation_* mask-set dirs, and says nothing about where
 #                      the dataset lives — that is --dataset_dir

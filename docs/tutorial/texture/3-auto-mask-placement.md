@@ -96,7 +96,7 @@ python -m anomalygen.scripts.auto_mask_placement.roi_place_pipeline \
 ```
 
 Details in the
-[mask-placement reference](../../../skills/anomalygen/references/mask-placement.md).
+[mask-placement reference](../../../skills/cdf-anomalygen/references/mask-placement.md).
 
 ______________________________________________________________________
 

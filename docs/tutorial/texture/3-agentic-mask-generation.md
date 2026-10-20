@@ -192,7 +192,7 @@ python -m anomalygen.scripts.agentic_mask_generation.generate \
 The three `--exemplar-*` / `--coverage-note` switches open the information channels a smaller
 model needs (per-example captions, exemplar structure views, the measured coverage note); each
 defaults OFF and costs wall-clock, so leave them off for cloud models. What each one does and
-why: the [AMG skill reference](../../../skills/anomalygen/references/agentic-mask-generation.md).
+why: the [AMG skill reference](../../../skills/cdf-anomalygen/references/agentic-mask-generation.md).
 
 ______________________________________________________________________
 
@@ -241,7 +241,7 @@ consequences.
 ### Quality levers (the local-model recipe)
 
 The five switches default OFF — a strong cloud model doesn't need them, a smaller model does; see
-the self-hosted section above and the [AMG skill reference](../../../skills/anomalygen/references/agentic-mask-generation.md) for what each one is. The accept bar is
+the self-hosted section above and the [AMG skill reference](../../../skills/cdf-anomalygen/references/agentic-mask-generation.md) for what each one is. The accept bar is
 a number and always in force.
 
 | flag                       | default | takes                 | what it does / cost when on                                                                                                            |

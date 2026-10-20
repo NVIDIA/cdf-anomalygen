@@ -111,8 +111,8 @@ Weights reach the service through the repo bind-mount itself: they live in `chec
 every other checkpoint (see above), and the recipe defaults `HF_HUB_CACHE` there — so the documented
 `docker run` needs **no weight flags at all**: no extra mount, no `HF_HOME`.
 
-The image and its `docker run` invocation are owned by the **`anomalygen-release`** skill —
-`skills/anomalygen-release/SKILL.md` and its `references/running.md`; take both from there rather
+The image and its `docker run` invocation are owned by the **`cdf-anomalygen-release`** skill —
+`skills/cdf-anomalygen-release/SKILL.md` and its `references/running.md`; take both from there rather
 than reconstructing them here. The serve command inside the container is the same recipe as on a dev
 host below: the image carries the whole repo at `/workspace/cdf-anomalygen`,
 `scripts/agentic_mask_generation_serving/` included. Everything above about **when** the service runs — Step 2 only,

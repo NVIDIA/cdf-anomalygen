@@ -1,5 +1,5 @@
 ---
-name: anomalygen-release
+name: cdf-anomalygen-release
 description: >-
   Use when building the cdf-anomalygen Docker image (develop / product /
   air-gapped) from docker/Dockerfile — build the chosen target from source and
@@ -12,7 +12,6 @@ metadata:
   owner: NVIDIA
   service: docker
   version: 1.2.0
-  reviewed: '2026-08-06'
   author: NVIDIA <nvidia@nvidia.com>
   tags:
       - physical-ai
@@ -23,14 +22,14 @@ metadata:
   frameworks: [docker]
 ---
 
-# Skill: anomalygen-release
+# Skill: cdf-anomalygen-release
 
 ## Purpose
 
 Build and run the **cdf-anomalygen** container. `docker/Dockerfile` reproduces
 `scripts/env_setup.sh` as a two-stage image (compile heavy wheels → slim non-root runtime).
 This is a **release/build** workflow — not training or inference
-(use the `anomalygen` skill for those). Build targets, GPU-arch lists, and troubleshooting
+(use the `cdf-anomalygen` skill for those). Build targets, GPU-arch lists, and troubleshooting
 detail live in `docker/README.md`. Run every command from the repo root.
 
 > **Check whether a build is needed at all.** Prebuilt images are published on
@@ -46,7 +45,7 @@ build a **develop** / **product** / **air-gapped** image, push it to a registry,
 run it. E.g. "build the anomalygen product container", "build an air-gapped develop
 image".
 
-Do not use it to run training or SDG generation — that's the `anomalygen` skill.
+Do not use it to run training or SDG generation — that's the `cdf-anomalygen` skill.
 
 ## Prerequisites
 

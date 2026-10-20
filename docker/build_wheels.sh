@@ -31,7 +31,7 @@
 #   apex                      git becbb77 (--cpp_ext --cuda_ext)
 #   flash-attn-3-nv           git c603389 (Hopper FA3)
 #   natten                    0.21.7      (compiled; no prebuilt for this combo)
-#   opencv-python-headless    4.14.0.94   (GitHub tag `94`, WITH_FFMPEG=OFF)
+#   opencv-python-headless    5.0.0.93    (GitHub tag `93`, WITH_FFMPEG=OFF)
 #
 # These wheels are architecture-specific (they carry compiled CUDA extensions),
 # so they are built and staged per-arch under wheels/<arch>/. The script builds
@@ -89,7 +89,7 @@ usage() { awk 'NR>=5 && /^#/ {print; next} NR>=5 {exit}' "$0"; }
 # Full X.Y.Z — pinned so the wheels are built on a known CPython patch. PY_VER is
 # the X.Y form, and the two are NOT interchangeable: the venv's site-packages
 # lives under lib/python3.13/, so path construction must use PY_VER.
-: "${PYTHON_VERSION:=3.13.15}"
+: "${PYTHON_VERSION:=3.13.16}"
 PY_VER="${PYTHON_VERSION%.*}"
 : "${TORCH_VERSION:=2.13.0+cu132}"
 : "${TORCHVISION_VERSION:=0.28.0+cu132}"
@@ -99,7 +99,7 @@ PY_VER="${PYTHON_VERSION%.*}"
 : "${APEX_SHA:=becbb77cea4cb54f2929f7c938a0a6f7dd1fdc39}"
 : "${FA3_SHA:=c603389369b8662a5cf94e5f0096ba739b99ffdd}"
 : "${NATTEN_VERSION:=0.21.7}"
-: "${OPENCV_TAG:=94}"   # = opencv-python-headless 4.14.0.94
+: "${OPENCV_TAG:=93}"   # = opencv-python-headless 5.0.0.93
 : "${MAX_JOBS:=16}"
 : "${NVCC_THREADS:=1}"
 # Compile environment for MODE A. Must be a CUDA *devel* image (nvcc + headers)
@@ -109,10 +109,10 @@ PY_VER="${PYTHON_VERSION%.*}"
 # uv, pinned by tag AND digest to its official multi-arch image — the same pin
 # docker/Dockerfile uses, so every build path gets a byte-identical binary.
 # MODE A extracts it from here and bind-mounts it into the build container.
-: "${UV_IMAGE:=ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1}"
+: "${UV_IMAGE:=ghcr.io/astral-sh/uv:0.12.22@sha256:f513a91fc62fe7c17567eee97230dd198e43edb8a9fbecca843714a4358fe1bc}"
 # Version-pinned installer, used only by MODE B's fallback when no uv is present
 # (a hand-run --in-container). Keep in sync with UV_IMAGE's tag.
-: "${UV_VERSION:=0.12.5}"
+: "${UV_VERSION:=0.12.22}"
 export PYTHON_VERSION TORCH_VERSION TORCHVISION_VERSION TORCH_INDEX_URL \
     FLASH_ATTN_VERSION TE_VERSION APEX_SHA FA3_SHA NATTEN_VERSION OPENCV_TAG \
     MAX_JOBS NVCC_THREADS UV_VERSION
@@ -163,7 +163,7 @@ build_in_container() {
 
     uv venv --clear --python "$PYTHON_VERSION"
     source .venv/bin/activate
-    uv pip install pip packaging wheel ninja cmake scikit-build
+    uv pip install --no-build pip packaging wheel ninja cmake scikit-build
 
     # ---- Step 3/12: torch — fixes the CUDA/ABI every wheel links against ----
     uv pip install torch=="$TORCH_VERSION" torchvision=="$TORCHVISION_VERSION" \
@@ -240,12 +240,13 @@ PYEOF
     # whatever APEX_SHA / FA3_SHA say. Globbing on the name alone therefore skips the
     # build after a pin bump and silently ships the stale wheel. The stamp records the
     # pin each wheel was built from, so a bump misses and rebuilds.
-    stamp_file() { echo "/wheels/.stamp-$1"; }
-    have() {
-        ls /wheels/"$1"-*.whl >/dev/null 2>&1 || return 1
-        [[ "$(cat "$(stamp_file "$1")" 2>/dev/null)" = "$2" ]]
+    stamp_file() { local name="$1"; echo "/wheels/.stamp-${name}"; }
+    have() {  # have <dist name> <pin>
+        local name="$1" pin="$2"
+        ls /wheels/"${name}"-*.whl >/dev/null 2>&1 || return 1
+        [[ "$(cat "$(stamp_file "$name")" 2>/dev/null)" = "$pin" ]]
     }
-    mark() { echo "$2" > "$(stamp_file "$1")"; }
+    mark() { local name="$1" pin="$2"; echo "$pin" > "$(stamp_file "$name")"; }
 
     # ---- Step 6/12: flash-attn (FA2) ----------------------------------------
     if have flash_attn "$FLASH_ATTN_VERSION"; then echo "skip flash-attn (already built)"; else
@@ -482,9 +483,11 @@ PYEOF
         done
     '
 
+# The wheel's version ends in the opencv-python tag it was built from (5.0.0.93 <- tag 93).
+OPENCV_WHEEL_VERSION="$(basename "$(ls "$WHEELS_DIR"/opencv_python_headless-*."${OPENCV_TAG}"-*.whl | head -1)" | cut -d- -f2)"
 echo "==> Uploaded. Consume via:"
 echo "    pip install --extra-index-url '${REPO_URL}/simple' \\"
 echo "      flash-attn==${FLASH_ATTN_VERSION} \\"
 echo "      transformer-engine==${TE_VERSION} transformer-engine-torch==${TE_VERSION} \\"
 echo "      apex natten==${NATTEN_VERSION} \\"
-echo "      opencv-python-headless==4.14.0.94   # FFmpeg-free build"
+echo "      opencv-python-headless==${OPENCV_WHEEL_VERSION}    # FFmpeg-free build, opencv-python tag ${OPENCV_TAG}"

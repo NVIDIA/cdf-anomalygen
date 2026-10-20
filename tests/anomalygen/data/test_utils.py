@@ -3,15 +3,24 @@
 
 """Unit tests for anomalygen.data.utils (caption/tokenizer/path helpers and the source item)."""
 
+import numpy as np
 import pytest
 import torch
+from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
+from cosmos_framework.data.generator.sequence_packing import SequencePlan
+from PIL import Image
 
 from anomalygen.data.utils import (
     CAPTION_TEMPLATE,
+    RAGGED_KEYS,
+    anomaly_class_ids,
+    anomalygen_collate_fn,
     build_caption,
     build_source_item,
     list_image_mask_pairs,
+    list_images,
     pad_or_truncate,
+    require_same_size,
     resolve_word_token_id,
     validate_anomaly_type,
 )
@@ -23,6 +32,10 @@ from anomalygen.data.utils import (
 )
 def test_validate_anomaly_type_accepts_the_real_recipe_values(anomaly_type):
     assert validate_anomaly_type(anomaly_type) == anomaly_type
+
+
+def test_anomaly_class_ids_are_positions_in_the_list():
+    assert anomaly_class_ids([["metal", "scratch"], ["wood", "hole"]]) == {"metal+scratch": 0, "wood+hole": 1}
 
 
 @pytest.mark.parametrize(
@@ -158,6 +171,58 @@ def test_list_image_mask_pairs_honours_suffix(tmp_path):
     assert pairs[0][1] == str(mask_dir / "a_mask.png")
 
 
+def test_list_images_matches_the_suffix_case_insensitively_and_sorts_by_name(tmp_path):
+    """The ONE dataset-directory lister (clean pools, submask sources): png/jpg/jpeg/bmp by lower-cased
+    suffix — `c.JPG` is an image — in name order, non-images left out."""
+    for name in ("b.png", "a.jpeg", "C.JPG", "d.BMP", "notes.txt", "e.tiff"):
+        _touch(tmp_path / name)
+    listed = list_images(tmp_path)
+    assert [p.name for p in listed] == ["C.JPG", "a.jpeg", "b.png", "d.BMP"], listed
+    assert all(p.parent == tmp_path for p in listed)
+    assert list_images(str(tmp_path)) == listed  # a str path is taken like a Path
+
+
+def test_list_images_of_a_missing_dir_or_a_file_is_empty(tmp_path):
+    _touch(tmp_path / "a.png")
+    assert list_images(tmp_path / "nope") == []
+    assert list_images(tmp_path / "a.png") == []
+
+
+# --- require_same_size --------------------------------------------------------------------------
+
+
+def _rgb(w, h):
+    return Image.fromarray(np.zeros((h, w, 3), np.uint8), mode="RGB")
+
+
+def _l(w, h):
+    return Image.fromarray(np.zeros((h, w), np.uint8), mode="L")
+
+
+def test_require_same_size_accepts_a_matching_pair():
+    assert require_same_size(_rgb(32, 48), _l(32, 48)) is None
+
+
+@pytest.mark.parametrize("mask_size", [(16, 48), (32, 24), (64, 96), (33, 48)])
+def test_require_same_size_rejects_any_disagreement(mask_size):
+    # (64, 96) is an exact 2x: a proportional mask is still wrong, the planner compares raw pixels.
+    with pytest.raises(ValueError, match="image/mask size mismatch"):
+        require_same_size(_rgb(32, 48), _l(*mask_size))
+
+
+def test_require_same_size_names_the_pair_and_both_sizes():
+    with pytest.raises(ValueError) as excinfo:
+        require_same_size(_rgb(32, 48), _l(16, 48), "img.png + mask.png")
+    msg = str(excinfo.value)
+    assert "img.png + mask.png" in msg and "32x48" in msg and "16x48" in msg
+
+
+def test_require_same_size_transposed_dims_are_rejected():
+    # Same pixel count, so any area-based check would pass it.
+    with pytest.raises(ValueError, match="image/mask size mismatch"):
+        require_same_size(_rgb(64, 32), _l(32, 64))
+
+
 # --- build_source_item --------------------------------------------------------------------------
 
 
@@ -223,3 +288,87 @@ def test_build_source_item_seed_does_not_advance_global_rng():
     torch.manual_seed(0)
     build_source_item(base, m3, seed=99)
     assert torch.equal(torch.rand(4), expected)
+
+
+# --------------------------------------------------------------------------------------------------
+# ragged batch collation — collate_with_ragged
+# --------------------------------------------------------------------------------------------------
+
+
+def _sample(h, w, class_id=0):
+    """One dataset item in the shape ``InpaintingDataset.__getitem__`` emits."""
+    rng = np.random.default_rng((h, w, class_id))
+    img = torch.from_numpy(rng.random((3, h, w), dtype=np.float32))
+    mask = torch.zeros(1, h, w)
+    mask[:, : h // 2, : w // 2] = 1.0
+    return {
+        "images": [img, img.clone()],
+        "text_token_ids": torch.zeros(4, dtype=torch.long),
+        "ai_caption": "a scratch on metal",
+        "image_size": [torch.tensor([h, w, h, w], dtype=torch.float32)] * 2,
+        "fps": 30.0,
+        "num_frames": 2,
+        "sequence_plan": SequencePlan(has_text=True, has_vision=True, condition_frame_indexes_vision=[]),
+        "edit_mask": mask,
+        "anomaly_class_id": class_id,
+        "dataset_name": "anomaly",
+    }
+
+
+def _assert_same_except_ragged(got, ref):
+    assert set(got) == set(ref)
+    for key in ref:
+        if key in RAGGED_KEYS:
+            continue
+        a, b = got[key], ref[key]
+        if isinstance(b, torch.Tensor):
+            assert torch.equal(a, b), key
+        else:
+            assert a == b, key
+
+
+def test_ragged_batch_keeps_the_mask_as_a_per_sample_list():
+    # The case that made this function necessary: two input sizes in one batch, which default_collate
+    # cannot stack.
+    batch = [_sample(64, 128), _sample(256, 64, class_id=1)]
+    out = anomalygen_collate_fn(batch)
+
+    assert isinstance(out["edit_mask"], list) and len(out["edit_mask"]) == 2
+    assert [tuple(m.shape) for m in out["edit_mask"]] == [(1, 64, 128), (1, 256, 64)]
+    # The masks are the sample tensors themselves, not copies pushed through a transform.
+    assert torch.equal(out["edit_mask"][0], batch[0]["edit_mask"])
+    # Non-ragged keys still collate normally.
+    assert out["anomaly_class_id"].tolist() == [0, 1]
+    assert len(out["images"]) == 2
+
+
+def test_ragged_batch_raises_under_the_framework_collate():
+    # Guards the premise: if the framework ever list-collated edit_mask itself this whole module
+    # would be dead code.
+    batch = [_sample(64, 128), _sample(256, 64)]
+    with pytest.raises(RuntimeError):
+        custom_collate_fn(batch)
+
+
+def test_uniform_batch_matches_the_framework_collate_on_every_other_key():
+    # A uniform batch must still match the framework's own collate: same keys, same values, only
+    # edit_mask differs.
+    batch = [_sample(64, 64), _sample(64, 64, class_id=1)]
+    out = anomalygen_collate_fn(batch)
+    ref = custom_collate_fn([{k: v for k, v in s.items() if k != "edit_mask"} for s in batch])
+    ref["edit_mask"] = torch.stack([s["edit_mask"] for s in batch])
+
+    _assert_same_except_ragged(out, ref)
+    # Uniform or not, the mask arrives as a list; the model accepts either form.
+    assert torch.equal(torch.stack(out["edit_mask"]), ref["edit_mask"])
+
+    # A batch carrying no ragged key at all must be the framework's own result, untouched.
+    plain = [{k: v for k, v in s.items() if k != "edit_mask"} for s in batch]
+    _assert_same_except_ragged(anomalygen_collate_fn(plain), custom_collate_fn(plain))
+
+
+def test_input_samples_are_not_mutated():
+    # The loader may reuse the sample dicts; stripping the ragged keys must not empty them.
+    batch = [_sample(64, 64), _sample(128, 64)]
+    anomalygen_collate_fn(batch)
+    assert all("edit_mask" in s for s in batch)

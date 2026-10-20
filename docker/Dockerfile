@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # =============================================================================
-# PAIDF AnomalyGen (paidf-anomalygen) Docker image — multi-stage build.
+# CDF AnomalyGen (cdf-anomalygen) Docker image — multi-stage build.
 #
 # STAGE GRAPH — three build stages, then four selectable targets:
 #
@@ -36,7 +36,8 @@
 #       *installs* things, in dependency order so a code edit rebuilds one layer:
 #         torch -> heavy wheels (registry, else stage 1's /wheels)
 #           -> requirements.txt -> cosmos-framework (pinned in
-#           requirements-nodeps.txt) -> app source + the two in-repo packages.
+#           requirements-nodeps.txt) -> vllm -> app source + the two in-repo
+#           packages.
 #       Also bakes the OSS source obligation into /usr/share/oss-sources. That
 #       collector lives in `docker/oss_bake.sh`, for the same reason the compile
 #       recipe lives in build_wheels.sh: it is a program, not image assembly.
@@ -51,8 +52,8 @@
 #       airgapped-product  product hardening + model checkpoints baked in
 #       airgapped-develop  dev tooling + the same baked checkpoints
 #       The airgapped-* targets need `--build-context ckpts=./checkpoints`. Both build on
-#       airgapped-base, which warms a uv cache and flips UV_NO_CACHE back off because the framework
-#       resolves the Edge caption processor through a `uv run`-ed HF CLI.
+#       airgapped-base, which bakes the environment for the framework's `uv run`-ed HF CLI so
+#       checkpoint resolves need no package index.
 #
 # Build and run commands — including the prebuilt-wheel index, the air-gapped
 # `ckpts` context, and the `docker run` invocation — live in docker/README.md.
@@ -68,9 +69,9 @@
 # =============================================================================
 ARG CUDA_DEVEL_BASE=nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04
 ARG CUDA_RUNTIME_BASE=nvidia/cuda:13.2.1-base-ubuntu24.04
-ARG PYTHON_VERSION=3.13.15
+ARG PYTHON_VERSION=3.13.16
 ARG PY_VER=${PYTHON_VERSION%.*}
-ARG UV_VERSION=0.12.5
+ARG UV_VERSION=0.12.22
 ARG TORCH_VER=2.13.0
 ARG TORCHVISION_VER=0.28.0
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu132
@@ -86,7 +87,7 @@ ARG FA3_SHA=c603389369b8662a5cf94e5f0096ba739b99ffdd
 # sam-2 installs from a pinned git commit, so its source is the archive at that commit.
 ARG SAM2_SHA=2b90b9f5ceec907a1c18123530e92e794ad901a4
 ARG NATTEN_VER=0.21.7
-ARG OPENCV_VER=4.14.0.94
+ARG OPENCV_VER=5.0.0.93
 # libquadmath is LGPL-2.1-or-later and outside the Runtime Library Exception that
 # covers libgfortran, so the copy bundled into the numpy and scipy wheels ships
 # with source. 8.5.0 is the manylinux_2_28 (AlmaLinux 8) GCC that auditwheel
@@ -99,17 +100,18 @@ ARG LIBGFORTRAN_LIBQUADMATH_GCC_VER=8.5.0
 # choose. The toolchain covers the standard library; a vulnerable module dependency needs its own
 # pin, which is what WANDB_GO_MODULES is. Keep WANDB_SRC_SHA in step with the wandb pin in
 # requirements.txt.
-ARG GO_VERSION=1.26.6
+ARG GO_VERSION=1.27.2
 # Pinned by tag AND digest, like uv and the CUDA bases. The tag is derived from GO_VERSION so there
 # is one place to bump; if the digest is not bumped with it the pull resolves to the old image, and
 # the toolchain assertion in the wandbcore stage fails rather than shipping it.
-ARG GO_BASE=golang:${GO_VERSION}@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6
-ARG WANDB_SRC_SHA=bc2cf24b1bd9fa3a1b6cbeb920087b832afc526f
-ARG WANDB_GO_MODULES="golang.org/x/net@v0.58.0 github.com/go-git/go-git/v5@v5.19.2 google.golang.org/grpc@v1.83.0 golang.org/x/image@v0.45.0"
+ARG GO_BASE=golang:${GO_VERSION}@sha256:5bc7f572bbaa98885a3a1fd9c0aa76b59e3e14e8628bfc316bbfd0c701e4818c
+ARG WANDB_SRC_SHA=e5ec9dc9236d1a4fbb9fe7c0795bbccdff1e0e77
+# x/crypto and x/net release in lockstep (x/crypto's go.mod requires x/net), so move them together.
+ARG WANDB_GO_MODULES="golang.org/x/crypto@v0.58.0 golang.org/x/net@v0.61.0 github.com/go-git/go-git/v5@v5.19.2 google.golang.org/grpc@v1.83.2 golang.org/x/image@v0.46.0"
 ARG MAX_JOBS=16
 ARG NVCC_THREADS=1
-# Bump for an Ubuntu security refresh, or to rebuild the OSS bake against the current archive.
-ARG APT_CACHE_BUST=2026-08-20
+# Bump for an Ubuntu security refresh; the apt half of the OSS bake refreshes with it.
+ARG APT_CACHE_BUST=2026-10-06
 # SHA-256 of the four OSS-bake artefacts that are NOT PyPI sdists (those carry a
 # digest from the PyPI JSON API and are checked inline). Recompute after bumping a
 # pin:  curl -sfL <url> | sha256sum
@@ -118,10 +120,18 @@ ARG APT_CACHE_BUST=2026-08-20
 # content before updating the digest rather than just refreshing it.
 ARG APEX_TARBALL_SHA256=51a3db0ae700dc9f843e5418aec3379c6cc227f4d7e02c59852038b8f02cb1bc
 ARG FA3_TARBALL_SHA256=ee3693af43ed54a614ecc5c3dd0f78e17d0637a0d44ad16aaabd3d493f0ce127
-ARG UV_TARBALL_SHA256=e349c9eb85876921895330f6fee5f01f109d5ec06dcd3b475fb7b4b8de75eac6
-ARG PYTHON_TARBALL_SHA256=1e66a7945a48390ee4c2a4268a0e4185884059a13c4aab6d148aa208deea4a76
+ARG UV_TARBALL_SHA256=056ef9a33d6812a51153799ce5b35b08f02f4f37b32a26d22e99245a1f16b77c
+ARG PYTHON_TARBALL_SHA256=f4b1bfb3c79b5bb11b8d228a12504163b4c0dab4d679828d8f5f26b6cb6ab35d
 ARG SAM2_TARBALL_SHA256=1f2fbfad3ffa38110368abac76c6ef9df9c282a66d5c2807bc94abf4d2fb30f8
 ARG LIBGFORTRAN_LIBQUADMATH_GCC_TARBALL_SHA256=d308841a511bb830a6100397b0042db24ce11f642dab6ea6ee44842e5325ed50
+
+# Every venv the image ships, for docker/oss_bake.sh to enumerate. One venv today: /opt/venv holds
+# the app AND vllm (they share torch 2.13.0+cu132; the vLLM stanza below). Kept a list because each
+# venv the image ships is its own redistribution, and it lives here rather than in the script so
+# adding a venv is one edit in the file that creates it.
+# MUST stay quoted, for the reason spelled out under TORCH_CUDA_ARCH_LIST below: an unquoted ARG
+# default stops at the first space, which would silently bake only the first venv of a longer list.
+ARG OSS_VENVS="/opt/venv"
 
 # GPU compute-capability list for the source-compile path (stage 1). Ignored on
 # the registry path, where stage 1 is skipped entirely.
@@ -172,7 +182,7 @@ ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 ENV UV_LINK_MODE=copy
 
 # uv pinned by tag AND digest. The digest makes the binary reproducible.
-COPY --from=ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.22@sha256:f513a91fc62fe7c17567eee97230dd198e43edb8a9fbecca843714a4358fe1bc /uv /uvx /usr/local/bin/
 ENV PATH="/usr/local/bin:$PATH"
 
 COPY docker/build_wheels.sh /tmp/build_wheels.sh
@@ -234,7 +244,7 @@ EOF
 # the registry or from stage 1's /wheels. Ordered cheapest-to-invalidate last,
 # so editing app code rebuilds only the final layers:
 #   apt -> uv/venv -> torch -> heavy wheels -> requirements.txt
-#     -> cosmos-framework -> app source
+#     -> cosmos-framework -> vllm -> app source
 # =============================================================================
 FROM ${CUDA_RUNTIME_BASE} AS runtime
 
@@ -262,6 +272,7 @@ ARG UV_TARBALL_SHA256
 ARG PYTHON_TARBALL_SHA256
 ARG SAM2_TARBALL_SHA256
 ARG LIBGFORTRAN_LIBQUADMATH_GCC_TARBALL_SHA256
+ARG OSS_VENVS
 ARG APP_UID
 ARG APP_GID
 
@@ -285,14 +296,21 @@ ENV SAM2_BUILD_ALLOW_ERRORS=1
 # venv. libgomp1 is torch's OpenMP runtime; libgl1/libglib2.0-0 are for opencv.
 # gcc/g++ are needed at runtime by torch.compile / Triton inductor to JIT the
 # kernel + C++ wrapper (ptxas is already bundled inside the triton wheel).
-# The dpkg snapshot taken first scopes the OSS source bake further down: it records
+# The dpkg snapshot taken first scopes the apt half of the OSS source bake: it records
 # what the base image already carries, so the bake fetches source for what WE add
 # on top. It has to happen here — afterwards the two sets are indistinguishable.
+#
+# That bake runs in THIS layer, off the index the install used, with deb-src on meanwhile. Ubuntu
+# drops a source from the pockets once a newer version supersedes it, so a bake in a later layer
+# fails whenever this layer is cached across a security update. Hence the collector is COPYed
+# in this early.
+COPY --chmod=0755 docker/oss_bake.sh /usr/local/bin/oss-bake
 RUN echo "apt-cache-bust: ${APT_CACHE_BUST}" \
      && export DEBIAN_FRONTEND=noninteractive \
      && dpkg-query -W -f='${source:Package}\n' | sort -u > /var/lib/oss-pkgs-before.txt \
+     && sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources \
      && apt-get update && apt-get install -y --no-install-recommends \
-     ca-certificates curl git gcc g++ jq libgomp1 libgl1 libglib2.0-0 \
+     ca-certificates curl g++ gcc git jq libgl1 libglib2.0-0 libgomp1 \
      # Hold the CUDA/NVIDIA stack before upgrading. The `wc -l` check is
      # load-bearing: a pattern that matches nothing leaves grep's non-zero status
      # invisible (RUN uses /bin/sh, which has no `pipefail`), so without it the
@@ -305,15 +323,20 @@ RUN echo "apt-cache-bust: ${APT_CACHE_BUST}" \
      && xargs -r apt-mark hold < /tmp/_hold.txt \
      && rm -f /tmp/_hold.txt \
      && apt-get upgrade -y --no-install-recommends \
+     && oss-bake apt \
+     # deb-src is a build-time need; leaving it on changes `apt-get update` for the user.
+     && sed -i 's/^Types: deb deb-src$/Types: deb/' /etc/apt/sources.list.d/ubuntu.sources \
      && rm -rf /var/lib/apt/lists/*
 
 # uv pinned by tag AND digest. The digest makes the binary reproducible.
-COPY --from=ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1 /uv /uvx /usr/local/bin/
-RUN uv venv --python ${PYTHON_VERSION} /opt/venv && uv pip install pip
-
-# torch runtime (bundles the CUDA userspace libs into the venv)
-RUN uv pip install torch==${TORCH_VER} torchvision==${TORCHVISION_VER} \
-     --index-url ${TORCH_INDEX_URL}
+COPY --from=ghcr.io/astral-sh/uv:0.12.22@sha256:f513a91fc62fe7c17567eee97230dd198e43edb8a9fbecca843714a4358fe1bc /uv /uvx /usr/local/bin/
+# --no-build on every wheel-only install in this stage: nothing there may run an sdist's setup.py.
+# The source installs (requirements.txt's sam2, cosmos-framework from git, the editable installs
+# of this repo) are builds by definition and cannot carry it.
+RUN uv venv --python "${PYTHON_VERSION}" /opt/venv && uv pip install --no-build pip \
+     # torch runtime (bundles the CUDA userspace libs into the venv)
+     && uv pip install --no-build torch=="${TORCH_VER}" torchvision=="${TORCHVISION_VER}" \
+     --index-url "${TORCH_INDEX_URL}"
 
 # Heavy deps: from the GitLab registry if a URL was given, else from the wheels
 # compiled in stage 1.
@@ -347,15 +370,37 @@ if [ -n "$GITLAB_PYPI_INDEX_URL" ]; then
     "$FA3_PKG"=="$FA3_VER" \
     natten=="$NATTEN_VER" \
     opencv-python-headless=="$OPENCV_VER"
-  uv pip install /tmp/regwheels/*.whl
+  uv pip install --no-build /tmp/regwheels/*.whl
   # Keep the FFmpeg-free headless wheel for the reinstall in the next layer.
   mkdir -p /tmp/cvwheel && cp /tmp/regwheels/opencv_python_headless-*.whl /tmp/cvwheel/
   rm -rf /tmp/regwheels
 else
-  uv pip install /wheels/*.whl
+  uv pip install --no-build /wheels/*.whl
   mkdir -p /tmp/cvwheel && cp /wheels/opencv_python_headless-*.whl /tmp/cvwheel/
 fi
 EOF
+
+# =============================================================================
+# vLLM — installed into the app venv, ahead of requirements.txt
+#
+# Serves gemma for the local AMG recipe (scripts/agentic_mask_generation_serving/); the app imports
+# nothing from it. Its torch/torchvision pins accept the +cu132 wheels, so the compiled stack stays.
+# Its tree caps setuptools<81, protobuf<7, numpy<2.5, lark==1.2.2; requirements.txt installs next
+# and lands protobuf and setuptools above the caps (metadata only).
+# Removed after the install: torchaudio (PyPI's build targets another CUDA wheel set), pycountry
+# (LGPL; its stand-in is installed with the other stubs below, which is also where the API server's
+# import is checked) and PyNvVideoCodec (bundles FFmpeg 8.1 with unfixed High CVEs; only an
+# optional video decoder).
+# Placed below the prebuilt wheels so a bump never re-triggers the compile, above requirements.txt
+# so its pins land last. Prove a VLLM_VER bump with an in-container `vllm serve` + completion.
+# =============================================================================
+ARG VLLM_VER=0.29.0
+# vllm's caps, pinned so a resolver change fails the assert instead of shipping.
+ARG VLLM_NUMPY_VER=2.4.6
+ARG VLLM_LARK_VER=1.2.2
+RUN uv pip install --no-build "vllm==${VLLM_VER}" "numpy==${VLLM_NUMPY_VER}" "lark==${VLLM_LARK_VER}" \
+     && uv pip uninstall torchaudio pycountry PyNvVideoCodec \
+     && test -x /opt/venv/bin/vllm
 
 # pip requirements. retinaface-py hard-requires the FFmpeg-bundling
 # `opencv-python`, which installs into the same cv2/ directory as the
@@ -363,17 +408,54 @@ EOF
 # cv2 namespace that still imports but fails at the first real call. Reinstall
 # the headless wheel last so cv2 is whole.
 COPY requirements.txt /tmp/requirements.txt
-RUN uv pip install -r /tmp/requirements.txt && rm -f /tmp/requirements.txt \
-     && (uv pip uninstall av opencv-python 2>/dev/null || true) \
-     && uv pip install --no-deps --force-reinstall /tmp/cvwheel/*.whl \
-     && rm -rf /tmp/cvwheel \
-     && python -c "import cv2; cv2.connectedComponentsWithStats; print('cv2 OK', cv2.__version__)" \
-     # Drop setuptools' vendored autocommand (LGPL-3.0-only).
-     # Verified: setuptools, build_meta and jaraco.text all still import.
-     && rm -rf /opt/venv/lib/python${PY_VER}/site-packages/setuptools/_vendor/autocommand \
-               /opt/venv/lib/python${PY_VER}/site-packages/setuptools/_vendor/autocommand-*.dist-info \
-     && test ! -e /opt/venv/lib/python${PY_VER}/site-packages/setuptools/_vendor/autocommand \
-     && python -c "import setuptools, setuptools.build_meta; import setuptools._vendor.jaraco.text; print('setuptools OK', setuptools.__version__)"
+RUN <<'EOF'
+set -eu
+uv pip install -r /tmp/requirements.txt && rm -f /tmp/requirements.txt
+uv pip uninstall av opencv-python 2>/dev/null || true
+uv pip install --no-build --no-deps --force-reinstall /tmp/cvwheel/*.whl
+rm -rf /tmp/cvwheel
+python -c "import cv2; cv2.connectedComponentsWithStats; print('cv2 OK', cv2.__version__)"
+# Drop setuptools' vendored autocommand (LGPL-3.0-only).
+# Verified: setuptools, build_meta and jaraco.text all still import.
+rm -rf "/opt/venv/lib/python${PY_VER}/site-packages/setuptools/_vendor/autocommand" \
+       "/opt/venv/lib/python${PY_VER}/site-packages/setuptools/_vendor/autocommand-"*.dist-info
+test ! -e "/opt/venv/lib/python${PY_VER}/site-packages/setuptools/_vendor/autocommand"
+python -c "import setuptools, setuptools.build_meta; import setuptools._vendor.jaraco.text; \
+  print('setuptools OK', setuptools.__version__)"
+
+# Guard against resolver drift in what requirements.txt does not pin: this is the last install that
+# may move anything, and a swapped torch stack strands the prebuilt wheels (flash-attn,
+# transformer-engine, apex, natten) compiled against it. importlib.metadata, not imports: a build
+# has no GPU. The +cu suffix comes from TORCH_INDEX_URL so the torch pins keep their single home above.
+python - <<'PYEOF'
+import importlib.metadata as md
+import importlib.util
+import os
+
+cu = os.environ["TORCH_INDEX_URL"].rstrip("/").rsplit("/", 1)[-1]
+want = {
+    "torch": f"{os.environ['TORCH_VER']}+{cu}",
+    "torchvision": f"{os.environ['TORCHVISION_VER']}+{cu}",
+    "vllm": os.environ["VLLM_VER"],
+    "numpy": os.environ["VLLM_NUMPY_VER"],
+    "lark": os.environ["VLLM_LARK_VER"],
+}
+for name, version in want.items():
+    got = md.version(name)
+    assert got == version, f"{name}: installed {got}, pinned {version}"
+for gone in ("torchaudio", "pycountry", "pynvvideocodec", "nltk"):
+    try:
+        md.version(gone)
+        raise AssertionError(f"{gone} is installed — removed from this image, so a resolve brought it back")
+    except md.PackageNotFoundError:
+        pass
+for module in ("torchaudio", "PyNvVideoCodec"):
+    assert importlib.util.find_spec(module) is None, f"a {module} module tree is still importable"
+print("pins OK:", ", ".join(f"{k}=={v}" for k, v in want.items()), "| torchaudio, pycountry, PyNvVideoCodec, nltk absent")
+PYEOF
+python -c "import wandb, google.protobuf; \
+  print('wandb OK', wandb.__version__, '| protobuf', google.protobuf.__version__)"
+EOF
 
 # The rebuilt wandb-core, from the stage above. Copied rather than built here so the Go toolchain
 # never enters this image and an unrelated requirements.txt edit does not re-run the compile.
@@ -383,24 +465,42 @@ COPY --from=wandbcore /wandb-core /opt/venv/lib/python${PY_VER}/site-packages/wa
 RUN test "$(python -c 'import pathlib, wandb; print(pathlib.Path(wandb.__file__).parent / "bin" / "wandb-core")')" \
      = "/opt/venv/lib/python${PY_VER}/site-packages/wandb/bin/wandb-core"
 
+# =============================================================================
+# STUBS — stand-ins for packages this image must not ship
+#
+# pycountry is LGPL; vllm's API server imports it through mistral-common, though only audio requests
+# use it. nltk carries an open advisory; the guardrail blocklist needs only its tokenizer and noun
+# lemmatizer. lerobot is imported by cosmos-framework's config builder; action datasets are never
+# used here. Each assets/<name>_stub/README.md has the details.
+# =============================================================================
+COPY assets/pycountry_stub /tmp/stubs/pycountry_stub
+COPY assets/nltk_stub /tmp/stubs/nltk_stub
+COPY assets/lerobot_stub /tmp/stubs/lerobot_stub
+RUN uv pip install --no-deps /tmp/stubs/pycountry_stub /tmp/stubs/nltk_stub /tmp/stubs/lerobot_stub \
+     && rm -rf /tmp/stubs \
+     && python -c "import vllm.entrypoints.openai.api_server; print('vllm api server imports OK')" \
+     && python -c "import nltk, lerobot.datasets.video_utils; assert nltk.IS_STUB; print('nltk and lerobot stubs OK')"
+
 # cosmos-framework, from the git commit pinned in requirements-nodeps.txt.
 COPY requirements-nodeps.txt /tmp/requirements-nodeps.txt
-RUN CF_SITE=/opt/venv/lib/python${PY_VER}/site-packages/cosmos_framework \
-     && uv pip install -r /tmp/requirements-nodeps.txt --no-deps \
+RUN uv pip install -r /tmp/requirements-nodeps.txt --no-deps \
      && rm -f /tmp/requirements-nodeps.txt \
-     # Drop cosmos-framework's vendored TaylorSeer helper.
-     && test -e "${CF_SITE}/model/generator/utils/taylorseer.py" \
-     && rm -f "${CF_SITE}/model/generator/utils/taylorseer.py" \
-               "${CF_SITE}/model/generator/utils/__pycache__/taylorseer."*.pyc \
-     && test ! -e "${CF_SITE}/model/generator/utils/taylorseer.py" \
-     # unified_mot is the module carrying the init_taylorseer flag-setting code.
-     && python -c "import cosmos_framework.model.generator.mot.unified_mot; print('cosmos_framework OK')"
+     && python -c "import cosmos_framework.model.generator.mot.unified_mot; print('cosmos_framework OK')" \
+     # The full resolution this build shipped, frozen to a diffable artifact: the pin assert above
+     # catches drift in the names that matter, this catches it everywhere else. The develop targets
+     # refresh it after requirements-dev.txt.
+     && uv pip freeze > /opt/venv-freeze.txt
 
 # Register the venv's bundled nvidia lib dirs with the dynamic linker.
 ENV NV_SITE=/opt/venv/lib/python${PY_VER}/site-packages/nvidia
 ENV LD_LIBRARY_PATH=${NV_SITE}/cudnn/lib:${NV_SITE}/nccl/lib:${NV_SITE}/cusparselt/lib
-RUN { for d in ${NV_SITE}/*/lib; do echo "$d"; done; } > /etc/ld.so.conf.d/cosmos.conf \
+RUN { for d in "${NV_SITE}"/*/lib; do echo "$d"; done; } > /etc/ld.so.conf.d/cosmos.conf \
      && ldconfig
+
+# Defaulted to 0 (overridable per run) because flashinfer's sampler JIT-compiles at KV-cache init
+# and this image ships no ninja — the JIT can never succeed here, and the failure arrives minutes
+# into engine startup as `ninja ... exit status 127`. The prebuilt native sampler needs no JIT.
+ENV VLLM_USE_FLASHINFER_SAMPLER=0
 
 # =============================================================================
 # OSS SOURCE-CODE BAKE — /usr/share/oss-sources
@@ -408,36 +508,40 @@ RUN { for d in ${NV_SITE}/*/lib; do echo "$d"; done; } > /etc/ld.so.conf.d/cosmo
 # Source for the third-party OSS in the image, travelling with it rather than refetchable later.
 # The collector is docker/oss_bake.sh; it documents the layout. Only what we ADD: the base image is a
 # published NVIDIA artifact with its own source obligation, NVIDIA's wheels are not third-party, and
-# paidf-anomalygen is ours. Known gap — `apt-get upgrade` moves base packages without renaming them,
+# cdf-anomalygen is ours. Known gap — `apt-get upgrade` moves base packages without renaming them,
 # so those stay on the base side of the diff.
 #
-# PLACEMENT: after the installs, so editing the bake does not re-run the >1 h wheel compile; before
-# `COPY . /workspace`, so a code change does not re-run the bake. The develop family runs the pip
-# half again once requirements-dev.txt is in, since develop is the target CI publishes.
+# PLACEMENT: the apt half ran in the apt layer above, where its sources are still in the archive.
+# The rest sits here, after the installs and before `COPY . /workspace`, so a code change does not
+# re-run the bake. The develop family runs the pip half again once requirements-dev.txt is in, since
+# develop is the target CI publishes. The wheel compile lives in stage 1, so an edit to the collector
+# re-runs this stage's downloads, never that compile.
+#
+# The pip half covers every venv named in OSS_VENVS — one today, /opt/venv. It sits below the vLLM
+# install above so vllm's tree is part of the bake.
 # =============================================================================
-COPY --chmod=0755 docker/oss_bake.sh /usr/local/bin/oss-bake
-RUN oss-bake archives && oss-bake apt && oss-bake pip && oss-bake manifest
+RUN oss-bake archives && oss-bake pip && oss-bake manifest
 
 # ---- Non-root user + app source (last, so code changes don't bust deps) -----
-RUN groupadd --gid ${APP_GID} nvidia \
-     && useradd --create-home --shell /bin/bash --uid ${APP_UID} --gid ${APP_GID} nvidia
+# Its own layer on purpose: APP_UID / APP_GID are build args, and folding this into the bake above
+# would re-download and re-verify every pinned archive whenever they change.
+RUN groupadd --gid "${APP_GID}" nvidia \
+     && useradd --create-home --shell /bin/bash --uid "${APP_UID}" --gid "${APP_GID}" nvidia
 
-COPY --chown=nvidia:nvidia . /workspace/paidf-anomalygen
-WORKDIR /workspace/paidf-anomalygen
+COPY --chown=nvidia:nvidia . /workspace/cdf-anomalygen
+WORKDIR /workspace/cdf-anomalygen
 
 # Must stay BELOW the COPY above — this is a source install, not a dependency
 # install, so it cannot be hoisted into the install section.
-RUN uv pip install -e assets/lerobot_stub --no-deps \
-     && uv pip install -e . --no-deps
+RUN uv pip install -e . --no-deps \
+     # The nvidia/cuda base ships the NGC Deep Learning Container licence at /, which
+     # governs this image's base layers. Surface it in the workdir beside LICENSE,
+     # NOTICE and LICENSE-3rd-party.txt so it is discoverable where a user actually
+     # looks — at / it is easy to miss.
+     && cp /NGC-DL-CONTAINER-LICENSE /workspace/cdf-anomalygen/NGC-DL-CONTAINER-LICENSE \
+     && chown nvidia:nvidia /workspace/cdf-anomalygen/NGC-DL-CONTAINER-LICENSE
 
-# The nvidia/cuda base ships the NGC Deep Learning Container licence at /, which
-# governs this image's base layers. Surface it in the workdir beside LICENSE,
-# NOTICE and LICENSE-3rd-party.txt so it is discoverable where a user actually
-# looks — at / it is easy to miss.
-RUN cp /NGC-DL-CONTAINER-LICENSE /workspace/paidf-anomalygen/NGC-DL-CONTAINER-LICENSE \
-     && chown nvidia:nvidia /workspace/paidf-anomalygen/NGC-DL-CONTAINER-LICENSE
-
-ENV PYTHONPATH=/workspace/paidf-anomalygen
+ENV PYTHONPATH=/workspace/cdf-anomalygen
 
 USER nvidia
 
@@ -461,7 +565,8 @@ ENV ANOMALYGEN_PRODUCT_MODE=1
 RUN for d in anomalygen assets ag_config scripts shmpatch; do \
      [ ! -e "$d" ] || { chown -R root:root "$d" && chmod -R a-w "$d"; }; \
      done \
-     && for f in README.md pyproject.toml requirements.txt requirements-nodeps.txt docker/Dockerfile docker/build_wheels.sh docker/oss_bake.sh; do \
+     && for f in README.md pyproject.toml requirements.txt requirements-nodeps.txt \
+                 docker/Dockerfile docker/build_wheels.sh docker/oss_bake.sh; do \
      [ ! -e "$f" ] || { chown root:root "$f" && chmod a-w "$f"; }; \
      done
 USER nvidia
@@ -477,48 +582,74 @@ FROM runtime AS airgapped-base
 # The two parents stay writable — HF locks under checkpoints/hf — and are made first, because a
 # COPY only owns what it writes.
 USER root
-RUN mkdir -p /workspace/paidf-anomalygen/checkpoints/hf \
-     && chown nvidia:nvidia /workspace/paidf-anomalygen/checkpoints \
-                            /workspace/paidf-anomalygen/checkpoints/hf
-COPY --from=ckpts Cosmos3-Nano           /workspace/paidf-anomalygen/checkpoints/Cosmos3-Nano
-COPY --from=ckpts Cosmos3-Edge           /workspace/paidf-anomalygen/checkpoints/Cosmos3-Edge
-COPY --from=ckpts wan2pt2/Wan2.2_VAE.pth /workspace/paidf-anomalygen/checkpoints/wan2pt2/Wan2.2_VAE.pth
-COPY --from=ckpts facebook/dinov2-large  /workspace/paidf-anomalygen/checkpoints/facebook/dinov2-large
-COPY --from=ckpts nvidia/C-RADIO-V3      /workspace/paidf-anomalygen/checkpoints/nvidia/C-RADIO-V3
+RUN mkdir -p /workspace/cdf-anomalygen/checkpoints/hf \
+     && chown nvidia:nvidia /workspace/cdf-anomalygen/checkpoints \
+                            /workspace/cdf-anomalygen/checkpoints/hf
+COPY --from=ckpts Cosmos3-Nano           /workspace/cdf-anomalygen/checkpoints/Cosmos3-Nano
+COPY --from=ckpts Cosmos3-Edge           /workspace/cdf-anomalygen/checkpoints/Cosmos3-Edge
+COPY --from=ckpts wan2pt2/Wan2.2_VAE.pth /workspace/cdf-anomalygen/checkpoints/wan2pt2/Wan2.2_VAE.pth
+COPY --from=ckpts facebook/dinov2-large  /workspace/cdf-anomalygen/checkpoints/facebook/dinov2-large
+COPY --from=ckpts nvidia/C-RADIO-V3      /workspace/cdf-anomalygen/checkpoints/nvidia/C-RADIO-V3
 COPY --from=ckpts hf/models--nvidia--Cosmos-Guardrail1 \
-     /workspace/paidf-anomalygen/checkpoints/hf/models--nvidia--Cosmos-Guardrail1
+     /workspace/cdf-anomalygen/checkpoints/hf/models--nvidia--Cosmos-Guardrail1
 COPY --from=ckpts hf/models--Qwen--Qwen3Guard-Gen-0.6B \
-     /workspace/paidf-anomalygen/checkpoints/hf/models--Qwen--Qwen3Guard-Gen-0.6B
+     /workspace/cdf-anomalygen/checkpoints/hf/models--Qwen--Qwen3Guard-Gen-0.6B
 # Caption tokenizer resolved from the HF cache.
 COPY --from=ckpts hf/models--Qwen--Qwen3-VL-8B-Instruct \
-     /workspace/paidf-anomalygen/checkpoints/hf/models--Qwen--Qwen3-VL-8B-Instruct
+     /workspace/cdf-anomalygen/checkpoints/hf/models--Qwen--Qwen3-VL-8B-Instruct
 COPY --from=ckpts hf/models--nvidia--Cosmos3-Edge \
-     /workspace/paidf-anomalygen/checkpoints/hf/models--nvidia--Cosmos3-Edge
+     /workspace/cdf-anomalygen/checkpoints/hf/models--nvidia--Cosmos3-Edge
+# Gemma weights for AMG local serving (scripts/agentic_mask_generation_serving/gemma-4-31b-it.sh). vLLM (in /opt/venv,
+# installed in the runtime stage) resolves google/gemma-4-31b-it from this HF cache by bare repo
+# id, so an offline serve needs the pinned-GEMMA_REV snapshot and the refs/main written beside it —
+# scripts/download_checkpoints.sh produces both, and records the two shards in the Hub manifest at
+# HuggingFace's published LFS oids. At ~62.6 GB this is the stage's largest COPY, larger than
+# everything above it put together. An air-gapped node cannot fetch what its image left out, so a
+# ckpts context missing the entry (an interrupted download) fails this COPY loudly rather than
+# shipping an image whose AMG serve dies at its first fetch.
+COPY --from=ckpts hf/models--google--gemma-4-31b-it \
+     /workspace/cdf-anomalygen/checkpoints/hf/models--google--gemma-4-31b-it
+# ROI segmentation: AMG (the default mask backend) hard-requires this checkpoint —
+# anomalygen/agentic_mask_generation/sam2.py resolves it repo-relative — and AMP's ROI generation
+# loads the same file.
+COPY --from=ckpts facebook/sam2.1-hiera-large \
+     /workspace/cdf-anomalygen/checkpoints/facebook/sam2.1-hiera-large
+# One Hub-manifest entry is deliberately not baked: checkpoints/nvidia/Cosmos3-Nano, the HF-format
+# Nano copy that text2roi grounding and the captioner resolve (~31.5 GB). The committed manifest
+# still records it, so assets/checkpoint_manifest.sha256 verifies fully against a host checkout,
+# not inside this image; in-image preflight reports that copy as a missing checkpoint (and skips
+# the integrity section) rather than as a digest failure.
+#
+# The HF_HUB_OFFLINE=1 / TRANSFORMERS_OFFLINE=1 pair set at the end of this stage is what makes the
+# baked copy authoritative, and it is also the constraint that makes the downloader's refs/main
+# write mandatory:
+# with them set, a cache miss fails loudly instead of silently resolving a mutable branch. vLLM
+# reads the same HF cache through huggingface_hub, so it inherits both — no vLLM-specific offline
+# flag is needed; the serving recipe points HF_HUB_CACHE at checkpoints/hf when run from the repo
+# root, which is exactly where this stage bakes the snapshot.
 USER root
-ENV UV_CACHE_DIR=/opt/uv/cache
-# "0", never "": uv parses this as a boolean and rejects an empty value, breaking every uv call.
-ENV UV_NO_CACHE=0
-# One RUN on purpose: a chmod in a later layer would rewrite all 23 MB and ship it twice.
+# The framework resolves HF-hosted checkpoints through its own locked HF CLI
+# (`checkpoint_db._hf_download` runs `uv run --project .../cosmos_framework/utils/hf_cli`), which a
+# disconnected node has no package index to build from. Bake that environment in instead.
+#
+# IMAGINAIRE_HF_CLI_ENVIRONMENT is the framework's hook for reusing one: set, it drops `--isolated`
+# and points uv here. Root-owned and read-only to the runtime user — uv only reads it.
+ENV IMAGINAIRE_HF_CLI_ENVIRONMENT=/opt/hf-cli-venv
 RUN <<'EOF'
 set -eu
 # Ask the interpreter for the path — ${PY_VER} is not re-declared in this stage.
-HF_CLI="$(python -c 'import importlib.util as iu, pathlib; print(pathlib.Path(iu.find_spec("cosmos_framework").origin).parent / "utils" / "hf_cli")')"
+HF_CLI="$(python -c "import importlib.util as iu, pathlib; \
+  print(pathlib.Path(iu.find_spec('cosmos_framework').origin).parent / 'utils' / 'hf_cli')")"
 test -f "$HF_CLI/uv.lock"
-mkdir -p "$UV_CACHE_DIR"
-# One run populates all 16 packages (~23 MB).
-uv run --isolated --project "$HF_CLI" --locked --no-default-groups hf --version
-# World-writable: uv rewrites the cache every run and `docker run --user` fixes no owner.
-# Never sticky — uv renames into place, and sticky stops a non-root uid replacing root's files.
-chmod -R a+rwX "$UV_CACHE_DIR"
-# Prove it offline as the runtime user, so a broken cache fails the build rather than a customer's
-# disconnected node. setpriv keeps the environment; `su` would reset PATH.
-# Drop the interpreter entry so the test hits the rename, like every runtime start does.
-rm -rf "$UV_CACHE_DIR"/interpreter-v*
+# --locked fails rather than re-resolve, so the environment matches the lock shipped beside it.
+UV_PROJECT_ENVIRONMENT="$IMAGINAIRE_HF_CLI_ENVIRONMENT" \
+     uv sync --project "$HF_CLI" --locked --no-default-groups
+# Prove it offline as the runtime user, so a broken environment fails the build rather than a
+# customer's disconnected node. setpriv keeps the environment; `su` would reset PATH.
 setpriv --reuid=nvidia --regid=nvidia --clear-groups \
-     env HOME=/tmp uv run --offline --isolated --project "$HF_CLI" --locked --no-default-groups hf --version
-# The self-test just wrote new entries under nvidia's umask; open those up too.
-chmod -R a+rwX "$UV_CACHE_DIR"
-echo "uv hf_cli cache: $(du -sh "$UV_CACHE_DIR" | cut -f1)"
+     env HOME=/tmp UV_PROJECT_ENVIRONMENT="$IMAGINAIRE_HF_CLI_ENVIRONMENT" \
+     uv run --offline --project "$HF_CLI" --locked --no-default-groups hf --version
+echo "hf_cli environment: $(du -sh "$IMAGINAIRE_HF_CLI_ENVIRONMENT" | cut -f1)"
 EOF
 # Make the baked checkpoints the only source a model can load from.
 #
@@ -542,7 +673,8 @@ ENV ANOMALYGEN_PRODUCT_MODE=1
 RUN for d in anomalygen assets ag_config scripts shmpatch; do \
      [ ! -e "$d" ] || { chown -R root:root "$d" && chmod -R a-w "$d"; }; \
      done \
-     && for f in README.md pyproject.toml requirements.txt requirements-nodeps.txt docker/Dockerfile docker/build_wheels.sh docker/oss_bake.sh; do \
+     && for f in README.md pyproject.toml requirements.txt requirements-nodeps.txt \
+                 docker/Dockerfile docker/build_wheels.sh docker/oss_bake.sh; do \
      [ ! -e "$f" ] || { chown root:root "$f" && chmod a-w "$f"; }; \
      done
 USER nvidia
@@ -552,9 +684,23 @@ CMD [ "/bin/bash" ]
 FROM airgapped-base AS airgapped-develop
 USER root
 ARG TORCH_INDEX_URL
-RUN uv pip install --no-cache -r requirements-dev.txt \
-     && python -c "import pathlib, setuptools; p = pathlib.Path(setuptools.__file__).parent / '_vendor' / 'autocommand'; assert not p.exists(), f'LGPL-3.0-only autocommand restored by requirements-dev.txt at {p}'; print('autocommand absent:', p)"
-RUN oss-bake pip && oss-bake manifest
+ARG OSS_VENVS
+RUN uv pip install --no-build --no-cache -r requirements-dev.txt \
+     && python -c "import pathlib, setuptools; \
+        p = pathlib.Path(setuptools.__file__).parent / '_vendor' / 'autocommand'; \
+        assert not p.exists(), f'LGPL-3.0-only autocommand restored by requirements-dev.txt at {p}'; \
+        print('autocommand absent:', p)" \
+     # Freeze refresh doubles as the drift check: requirements-dev.txt may not move the served /
+     # compiled-against stack, and torchaudio must stay absent (empty on both sides). Line-compare
+     # against the runtime freeze so the pins keep their single home.
+     && oss-bake pip && oss-bake manifest \
+     && uv pip freeze > /tmp/freeze-dev.txt \
+     && for p in torch torchvision transformers vllm torchaudio; do \
+          a=$(grep -E "^${p}==" /opt/venv-freeze.txt || true); \
+          b=$(grep -E "^${p}==" /tmp/freeze-dev.txt || true); \
+          [ "$a" = "$b" ] || { echo "requirements-dev.txt moved ${p}: '${a}' -> '${b}'" >&2; exit 1; }; \
+        done \
+     && mv /tmp/freeze-dev.txt /opt/venv-freeze.txt
 USER nvidia
 CMD [ "/bin/bash" ]
 
@@ -563,8 +709,22 @@ CMD [ "/bin/bash" ]
 FROM runtime AS develop
 USER root
 ARG TORCH_INDEX_URL
-RUN uv pip install --no-cache -r requirements-dev.txt \
-     && python -c "import pathlib, setuptools; p = pathlib.Path(setuptools.__file__).parent / '_vendor' / 'autocommand'; assert not p.exists(), f'LGPL-3.0-only autocommand restored by requirements-dev.txt at {p}'; print('autocommand absent:', p)"
-RUN oss-bake pip && oss-bake manifest
+ARG OSS_VENVS
+RUN uv pip install --no-build --no-cache -r requirements-dev.txt \
+     && python -c "import pathlib, setuptools; \
+        p = pathlib.Path(setuptools.__file__).parent / '_vendor' / 'autocommand'; \
+        assert not p.exists(), f'LGPL-3.0-only autocommand restored by requirements-dev.txt at {p}'; \
+        print('autocommand absent:', p)" \
+     # Freeze refresh doubles as the drift check: requirements-dev.txt may not move the served /
+     # compiled-against stack, and torchaudio must stay absent (empty on both sides). Line-compare
+     # against the runtime freeze so the pins keep their single home.
+     && oss-bake pip && oss-bake manifest \
+     && uv pip freeze > /tmp/freeze-dev.txt \
+     && for p in torch torchvision transformers vllm torchaudio; do \
+          a=$(grep -E "^${p}==" /opt/venv-freeze.txt || true); \
+          b=$(grep -E "^${p}==" /tmp/freeze-dev.txt || true); \
+          [ "$a" = "$b" ] || { echo "requirements-dev.txt moved ${p}: '${a}' -> '${b}'" >&2; exit 1; }; \
+        done \
+     && mv /tmp/freeze-dev.txt /opt/venv-freeze.txt
 USER nvidia
 CMD [ "/bin/bash" ]

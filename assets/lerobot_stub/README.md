@@ -17,7 +17,8 @@ the import without disturbing the environment.
 
 ## How it's wired
 
-`scripts/env_setup.sh` installs it editable alongside the framework:
+`docker/Dockerfile` installs it with the other stubs in one layer, before cosmos-framework;
+`scripts/env_setup.sh` and `scripts/env_setup_ci_cpu.sh` install it editable alongside the framework:
 
 ```shell
 uv pip install -e assets/lerobot_stub --no-deps

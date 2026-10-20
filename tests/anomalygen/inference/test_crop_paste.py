@@ -11,10 +11,11 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from anomalygen.configs.texture.constants import MIN_CROP_RATIO
+from anomalygen.data.utils import MASK_FG_THRESHOLD
 from anomalygen.inference.crop_paste import (
     annotate,
     best_crop,
-    crop_grid_by_ratio,
     enlarge_mask,
     feathered_alpha,
     mask_bbox,
@@ -39,12 +40,6 @@ def test_mask_bbox_empty_raises():
         mask_bbox(Image.fromarray(np.zeros((10, 10), np.uint8), mode="L"))
 
 
-def test_crop_grid_by_ratio():
-    # bbox side = max(15-5+1, 20-10+1) = 11; * 2.0 -> 22.
-    assert crop_grid_by_ratio(_mask(box=(5, 10, 15, 20)), 2.0) == 22
-    assert crop_grid_by_ratio(_mask(box=(5, 10, 15, 20)), 0.0) == 1  # never smaller than 1
-
-
 def test_best_crop_centers_and_clamps():
     img = Image.fromarray(np.full((100, 100, 3), 50, np.uint8), mode="RGB")
     mask = _mask(size=100, box=(40, 40, 60, 60))
@@ -54,11 +49,25 @@ def test_best_crop_centers_and_clamps():
     assert cropped_mask.size == (32, 32)
 
 
+def test_best_crop_centers_on_a_defect_larger_than_the_window():
+    # Regression: the shared placement rule confines the origin to the range that CONTAINS the mask,
+    # which is empty when the window is smaller than the defect. Returning 0 there put the window at
+    # the far edge of the image with no defect pixels in it at all, so generation silently no-opped
+    # (empty mask -> all-background source -> zero alpha -> composite identical to the input).
+    img = Image.fromarray(np.full((200, 200, 3), 50, np.uint8), mode="RGB")
+    mask = _mask(size=200, box=(120, 120, 180, 180))  # 61px defect, wider than the 32px window
+    cropped_image, cropped_mask, offset = best_crop(img, mask, grid_x=32, grid_y=32)
+
+    assert cropped_image.size == cropped_mask.size == (32, 32)
+    assert int((np.array(cropped_mask) >= MASK_FG_THRESHOLD).sum()) > 0, "window must show the defect"
+    assert offset == (134, 134)  # centred on the bbox, not pinned to the origin
+
+
 def test_best_crop_empty_mask_raises():
     img = Image.fromarray(np.zeros((40, 40, 3), np.uint8), mode="RGB")
     empty = Image.fromarray(np.zeros((40, 40), np.uint8), mode="L")
     with pytest.raises(ValueError):
-        best_crop(img, empty)
+        best_crop(img, empty, grid_x=32, grid_y=32)
 
 
 def test_enlarge_mask_grows_foreground():
@@ -135,3 +144,55 @@ def test_annotate_returns_rgb_same_size():
     out = annotate(img, mask, crop_offset=(5, 5), crop_size=(40, 40), label="crop")
     assert out.mode == "RGB"
     assert out.size == img.size
+
+
+# --- the image/mask pair invariant ----------------------------------------------------------------
+
+
+def test_best_crop_takes_its_extent_from_the_image_not_the_mask():
+    # Regression: best_crop clamped against ``mask.size``, but the window was planned against the
+    # IMAGE's extent, so a mask-derived clamp cut a window smaller than the plan that
+    # fit_to_input_size then stretched onto the input size — wrong scale and aspect, no error.
+    img = Image.fromarray(np.full((100, 100, 3), 50, np.uint8), mode="RGB")
+    mask = _mask(size=100, box=(40, 40, 60, 60))
+    cropped_image, cropped_mask, _ = best_crop(img, mask, grid_x=64, grid_y=64)
+    assert cropped_image.size == cropped_mask.size == (64, 64)
+
+
+def test_best_crop_rejects_a_mismatched_pair():
+    img = Image.fromarray(np.full((100, 100, 3), 50, np.uint8), mode="RGB")
+    with pytest.raises(ValueError, match="image/mask size mismatch"):
+        best_crop(img, _mask(size=50, box=(10, 10, 20, 20)), grid_x=32, grid_y=32)
+
+
+def test_paste_back_rejects_a_mismatched_crop():
+    crop = Image.fromarray(np.full((40, 40, 3), 10, np.uint8), mode="RGB")
+    recon = Image.fromarray(np.full((40, 40, 3), 200, np.uint8), mode="RGB")
+    with pytest.raises(ValueError, match="image/mask size mismatch"):
+        paste_back(
+            input_image=Image.fromarray(np.zeros((100, 100, 3), np.uint8), mode="RGB"),
+            recon_image=recon,
+            cropped_image=crop,
+            cropped_mask=_mask(size=20, box=(2, 2, 8, 8)),
+            offset=(0, 0),
+        )
+
+
+@pytest.mark.parametrize("crop", [33, 34, 40, 64, 128, 211])
+def test_paste_back_ramp_finishes_inside_a_small_crop(crop):
+    """A crop small relative to the ramp would otherwise still be blending at its border, leaving
+    the rectangular seam feathering exists to hide. Reachable under crop_mode="ratio"."""
+    side = max(1, round(crop / MIN_CROP_RATIO))
+    image = Image.fromarray(np.full((crop * 3, crop * 3, 3), 40, np.uint8), "RGB")
+    arr = np.zeros((crop, crop), np.uint8)
+    lo = (crop - side) // 2
+    arr[lo : lo + side, lo : lo + side] = 255
+    mask = Image.fromarray(arr, "L")
+    off = (crop, crop)
+    cropped = image.crop((off[0], off[1], off[0] + crop, off[1] + crop))
+    recon = Image.fromarray(np.full((crop, crop, 3), 220, np.uint8), "RGB")
+
+    out = np.asarray(paste_back(image, recon, cropped, mask, off).convert("RGB"), np.int16)
+    inside = out[off[1], off[0] : off[0] + crop, 0]
+    outside = out[off[1] - 1, off[0] : off[0] + crop, 0]
+    assert np.abs(inside - outside).max() == 0, "composite steps at the crop border"

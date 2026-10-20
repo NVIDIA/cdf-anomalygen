@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example config for `python -m anomalygen.scripts.run_pipeline --config <this>` with the AGENTIC
+# mask backend (`amg`). Same keys as example.yaml -- read that file for what each one does; this
+# one shows the values an amg run takes, with the shipped local-Gemma recipe.
+#
+# `amg_serve: gemma-4-31b-it` below means run_pipeline starts and stops the server itself, on the
+# first 2 visible GPUs -- nothing needs to be started by hand. If a server is already up on :8902
+# (started by an operator, or by a previous run that did not shut down cleanly), run_pipeline finds
+# it and reuses it rather than starting a second copy -- but a reused server is not this run's to
+# stop, so it keeps its GPUs claimed for the WHOLE run, leaving fewer than the visible total for
+# any generate/refine stage that runs afterwards.
+#
+# Under the workflow the service is started by the orchestrator, which sets amg_model_registry
+# instead and leaves amg_serve null; run_pipeline only reads the registry then.
+
+# ── required ──────────────────────────────────────────────────────────────────
+input:  datasets/uc1pega                          # dataset root, in the Step 1 layout; no defect_spec.jsonl needed
+output: results/uc1_amg_run
+recipe: ag_config/exp_texture_ft_pcb.yaml
+checkpoint: results/.../iter_000014000.pt         # fine-tuned checkpoint (generate, refine)
+
+# ── what to generate ──────────────────────────────────────────────────────────
+num_sdg: 40
+per_defect_counts: {passive_component+missing: 40}   # omit to place every <texture>/mask/<defect>/ on disk
+mode: inference
+amp_per_clean_pairing: off    # `on` is an amp pairing rule and is refused under amg
+
+# ── sampling (written into every testcase row after the amg stage) ────────────
+guidance: 3.0
+num_steps: 35
+crop_ratio: 2.0
+
+# ── seeds ─────────────────────────────────────────────────────────────────────
+amp_seed: 42          # no effect under amg (placement is by model judgment); kept so a config can
+                      # switch backend by editing `stages` alone
+base_seed: 1          # diffusion noise, generate.py
+
+# ── execution ─────────────────────────────────────────────────────────────────
+num_gpus: 1
+num_search_run: 3
+guardrail: true
+base_checkpoint: null
+
+# ── output naming ─────────────────────────────────────────────────────────────
+# source needs one output per clean; amg reuses a clean once num_sdg exceeds the clean count, so
+# indexed is the safe default under amg.
+output_naming: indexed
+
+# ── mask backend: amg ─────────────────────────────────────────────────────────
+amg_serve: gemma-4-31b-it   # run_pipeline starts the shipped Gemma recipe itself (first 2 visible
+                            # GPUs), so no registry and no model names are needed for a local run
+amg_gen_model: null         # defaults to the recipe's model; set for a different proposer
+amg_judge_model: null       # defaults to the recipe's model; e.g. azure/openai/gpt-6-astra with
+                            # a registry that names it
+amg_model_registry: null    # only for models the recipe does not serve
+amg_cache_dir: null   # null -> <output>/amg_cache; point every run of one dataset at a shared dir
+                      # to reuse the distilled defect library
+
+# The local Gemma recipe: a small model needs the in-loop beam and the three information channels.
+# For a strong cloud model set all five to their defaults (0 / false).
+amg_beam_multi: 4
+amg_beam_pairwise: true
+amg_exemplar_captions: true
+amg_exemplar_visual_prompt: true
+amg_coverage_note: true
+
+# ── object storage ────────────────────────────────────────────────────────────
+# Omitted: everything local. See example.yaml for the staging.fetch / staging.publish block; under
+# amg the registry file can be fetched too (staging.fetch.amg_model_registry), which is how an
+# orchestrator hands the model endpoint URL to a run.
+staging: null
+
+# ── stages ────────────────────────────────────────────────────────────────────
+stages: [amg, generate, evaluate, refine, export]

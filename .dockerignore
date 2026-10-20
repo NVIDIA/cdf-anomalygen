@@ -5,7 +5,7 @@
 #
 # This block mirrors the credential entries in .gitignore, and has to exist separately from them:
 # .gitignore keeps these OUT OF GIT, which is exactly why they are present as untracked files in a
-# working tree — and `COPY . /workspace/paidf-anomalygen` below sends the whole context, so without
+# working tree — and `COPY . /workspace/cdf-anomalygen` below sends the whole context, so without
 # these patterns a developer's .env is baked into a layer of an image published to a registry.
 # A credential in a published layer is disclosed to everyone who pulls it and survives deletion in
 # a later layer, so it must never enter the context in the first place.
@@ -15,6 +15,9 @@
 *.env
 .env.*
 /credentials
+# The live model registry: carries per-endpoint `key:` values. The template
+# (endpoints.example.yaml) stays in the context; only the filled-in copy is banned.
+scripts/agentic_mask_generation_serving/endpoints.yaml
 .netrc
 .npmrc
 .pypirc

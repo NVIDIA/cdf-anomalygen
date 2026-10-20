@@ -39,6 +39,11 @@ from anomalygen.auto_mask_placement.roi_generation.default_config import ROIGene
 from anomalygen.auto_mask_placement.roi_generation.model import ROIGenerationModels
 from anomalygen.auto_mask_placement.roi_generation.pipeline import run_roi_pipeline
 
+_REDACTED = "[redacted]"
+_ERR_NO_FILE = "No file provided"
+_ERR_FILE_TYPE = "Invalid file type"
+_ROI_VISUALIZATION_PNG = "roi_visualization.png"
+
 app = Flask(__name__, static_folder="../frontend/public", static_url_path="")
 
 # No CORS. This app serves its own UI from static_folder above, and the page calls the API with a
@@ -167,7 +172,7 @@ def _redact_secrets_from_errors(response):
     if response.status_code < 400 or not response.is_json:
         return response
     body = response.get_data(as_text=True)
-    redacted = _SECRET_PATTERN.sub("[redacted]", body)
+    redacted = _SECRET_PATTERN.sub(_REDACTED, body)
     if redacted != body:
         response.set_data(redacted)
     return response
@@ -182,9 +187,9 @@ _TOKEN_IN_URL = re.compile(r"(?<=token=)[^\s&\"]+")
 class _RedactTokenInAccessLog(logging.Filter):
     def filter(self, record):
         if isinstance(record.msg, str):
-            record.msg = _TOKEN_IN_URL.sub("[redacted]", record.msg)
+            record.msg = _TOKEN_IN_URL.sub(_REDACTED, record.msg)
         if isinstance(record.args, tuple):
-            record.args = tuple(_TOKEN_IN_URL.sub("[redacted]", a) if isinstance(a, str) else a for a in record.args)
+            record.args = tuple(_TOKEN_IN_URL.sub(_REDACTED, a) if isinstance(a, str) else a for a in record.args)
         return True
 
 
@@ -367,14 +372,7 @@ def process_stage_result_of_template_box_to_masks(result_json_path, config, imag
                     )
 
             # Fallback: use current image dimensions
-            if scale_factor == 1.0:
-                max_resize = 1024
-                original_max_dim = max(img_width, img_height)
-                if original_max_dim > max_resize:
-                    scale_factor = original_max_dim / max_resize
-                    log.info(
-                        f"[Process Template-Box-to-Masks Result] Fallback: Estimated scale factor from current image: {scale_factor:.3f} ({img_width}x{img_height})"
-                    )
+            scale_factor = _fallback_scale_factor(scale_factor, img_width, img_height)
 
             # Get candidate boxes and filter metrics
             candidate_boxes = np.array(result_data["candidate_boxes"])
@@ -469,7 +467,7 @@ def process_stage_result_of_template_box_to_masks(result_json_path, config, imag
                         # (except template boxes which are already in original coordinates unless refined/resized)
                         boxes_for_viz = stage_boxes
 
-                        should_scale = scale_factor != 1.0
+                        should_scale = scale_factor > 1.0
                         if stage_key == "template" and not is_refined_template:
                             should_scale = False
 
@@ -541,6 +539,31 @@ def image_to_base64(image_path):
     """Convert image file to base64 string"""
     with open(image_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
+
+
+def _intermediate_images(output_dir):
+    """Base64 of the first seed's intermediate images, by result key. A missing file is left out."""
+    names = {
+        "roi_visualization": _ROI_VISUALIZATION_PNG,
+        "cropped_submask": "cropped_submask.png",
+        "combined_rois_binary": "combined_rois_binary.png",
+    }
+    paths = {key: os.path.join(output_dir, name) for key, name in names.items()}
+    return {key: image_to_base64(path) for key, path in paths.items() if os.path.exists(path)}
+
+
+def _fallback_scale_factor(scale_factor, img_width, img_height):
+    """Keep a scale factor found from the processed image. While it is still the 1.0 default, estimate
+    one from the current image against the pipeline's 1024px resize limit."""
+    max_resize = 1024
+    original_max_dim = max(img_width, img_height)
+    if scale_factor > 1.0 or original_max_dim <= max_resize:
+        return scale_factor
+    scale_factor = original_max_dim / max_resize
+    log.info(
+        f"[Process Template-Box-to-Masks Result] Fallback: Estimated scale factor from current image: {scale_factor:.3f} ({img_width}x{img_height})"
+    )
+    return scale_factor
 
 
 def array_to_base64(img_array):
@@ -812,7 +835,7 @@ def reset_output_directory():
 def upload_input_image():
     try:
         if "file" not in request.files:
-            return jsonify({"error": "No file provided"}), 400
+            return jsonify({"error": _ERR_NO_FILE}), 400
 
         file = request.files["file"]
         if file.filename == "":
@@ -848,7 +871,7 @@ def upload_input_image():
                 }
             )
 
-        return jsonify({"error": "Invalid file type"}), 400
+        return jsonify({"error": _ERR_FILE_TYPE}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -857,7 +880,7 @@ def upload_input_image():
 def upload_submask():
     try:
         if "file" not in request.files:
-            return jsonify({"error": "No file provided"}), 400
+            return jsonify({"error": _ERR_NO_FILE}), 400
 
         file = request.files["file"]
         if file.filename == "":
@@ -884,7 +907,7 @@ def upload_submask():
                     "image": image_to_base64(filepath),
                 }
             )
-        return jsonify({"error": "Invalid file type"}), 400
+        return jsonify({"error": _ERR_FILE_TYPE}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1014,7 +1037,7 @@ def validate_submask_pool():
 def upload_roi_json():
     try:
         if "file" not in request.files:
-            return jsonify({"error": "No file provided"}), 400
+            return jsonify({"error": _ERR_NO_FILE}), 400
 
         file = request.files["file"]
         if file and file.filename.endswith(".json"):
@@ -1039,7 +1062,7 @@ def upload_roi_json():
                     "illegal_rois": total_count - legal_count,
                 }
             )
-        return jsonify({"error": "Invalid file type"}), 400
+        return jsonify({"error": _ERR_FILE_TYPE}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1215,7 +1238,7 @@ def clear_roi_json():
 def upload_roi_image():
     try:
         if "file" not in request.files:
-            return jsonify({"error": "No file provided"}), 400
+            return jsonify({"error": _ERR_NO_FILE}), 400
 
         file = request.files["file"]
         is_legal = request.form.get("is_legal", "true").lower() == "true"
@@ -1428,7 +1451,7 @@ def generate_masks():
 
             # Save visual for first seed
             if i == 0:
-                amp.visualize_rois(os.path.join(output_dir, "roi_visualization.png"))
+                amp.visualize_rois(os.path.join(output_dir, _ROI_VISUALIZATION_PNG))
 
             output_paths = amp.process_submask(
                 resized_submask_path,
@@ -1452,18 +1475,7 @@ def generate_masks():
 
                 # Add intermediate results for first seed
                 if i == 0:
-                    inter_res = {}
-                    if os.path.exists(os.path.join(output_dir, "roi_visualization.png")):
-                        inter_res["roi_visualization"] = image_to_base64(
-                            os.path.join(output_dir, "roi_visualization.png")
-                        )
-                    if os.path.exists(os.path.join(output_dir, "cropped_submask.png")):
-                        inter_res["cropped_submask"] = image_to_base64(os.path.join(output_dir, "cropped_submask.png"))
-                    if os.path.exists(os.path.join(output_dir, "combined_rois_binary.png")):
-                        inter_res["combined_rois_binary"] = image_to_base64(
-                            os.path.join(output_dir, "combined_rois_binary.png")
-                        )
-                    result["intermediate_results"] = inter_res
+                    result["intermediate_results"] = _intermediate_images(output_dir)
 
                 # Add augmented masks
                 aug_masks = []

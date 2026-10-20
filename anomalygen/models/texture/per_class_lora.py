@@ -11,12 +11,14 @@ batch. The adapters are stacked (``A: [C, r, in]``, ``B: [C, out, r]``) and sele
 
 Routing arrives as the ``gen_class_ids`` buffer, refilled each forward by the eager encode head
 (``AnomalyVFMNetwork._encode_vision``) before the compiled blocks run — a buffer, not a Python
-attribute (``fullgraph=True`` would bake an attribute as a constant). Needs ``use_cuda_graphs=False``
-and ``cp_world_size=1`` so every gen row aligns 1:1 with the routing vector, in ``full_only_seq``
-order (== ``sorted(sequence_indexes)``); one vector serves every layer.
+attribute (``fullgraph=True`` would bake an attribute as a constant). Needs ``cp_world_size=1`` so every gen
+row aligns 1:1 with the routing vector, in ``full_only_seq`` order (== ``sorted(sequence_indexes)``);
+one vector serves every layer. The packer pads that stream with a trailing segment (for CUDA-graph
+bucketing, and one row unconditionally so attention sees the padding as a segment of its own), which
+the routing vector does not cover — those rows are left on the frozen base.
 
-DDP: the per-row gather ``lora_A[c]`` scatters its backward into the full-shape grad, so both
-adapters always enter the graph (no unused-param error) and an absent class gets a zero grad.
+DDP: every class's slice of ``lora_A``/``lora_B`` enters the graph each step, so no parameter is
+unused and an absent class gets a zero grad.
 """
 
 from __future__ import annotations
@@ -61,16 +63,26 @@ class PerClassLoraLinear(nn.Linear):
         base_out = F.linear(x, self.weight, self.bias)
         c = self.gen_class_ids
         n = x.shape[0]
-        # Route only when the buffer covers this batch's rows exactly. Empty -> routing unset
-        # (non-anomaly path) => frozen base. A mismatch means padded/sharded rows (cuda-graphs /
-        # context-parallel, both unsupported) => fall back to base rather than mis-route.
-        if c.numel() != n:
+        m = c.numel()
+        # The routing vector covers the real gen rows. The packer appends a trailing pad segment
+        # to the gen stream, so `n` is the routed rows plus that padding; those rows belong to no
+        # sample and get no adapter. Empty -> routing unset (non-anomaly path) => frozen base.
+        # More ids than rows means the rows were sharded away (context-parallel, unsupported) =>
+        # fall back to base rather than mis-route.
+        if m == 0 or m > n:
             return base_out
-        # Per-row gather of each row's adapter. Its backward scatters into the full-shape lora_A/lora_B
-        # (zero for absent classes), so both always enter the graph -> DDP-safe. ~1/C the cost of
-        # contracting all C then selecting, and equivalent (verified for world_size 1 and 2).
-        z = torch.einsum("nri,ni->nr", self.lora_A[c], x)  # [n, r]
-        d = torch.einsum("nor,nr->no", self.lora_B[c], z)  # [n, out]
+        x_routed = x[:m]
+        # Contract against all C adapters and mask with a one-hot: the non-matching classes
+        # contribute exactly zero, so this equals the definition above. Both adapters enter the
+        # graph on every call (an absent class gets a zero grad), so DDP sees no unused param.
+        # Do NOT rewrite as the per-row gather lora_A[c] / lora_B[c]. It has 1/C the FLOPs but
+        # expands the adapter to a per-token [m, r, in] copy (134 MiB at m=2048), so it is
+        # memory-bound and measures slower in both directions despite the arithmetic saving.
+        onehot = F.one_hot(c, self._num_classes).to(x.dtype)  # [m, C]
+        z = torch.einsum("cri,ni->ncr", self.lora_A, x_routed)  # [m, C, r]
+        d = torch.einsum("cor,ncr->no", self.lora_B, z * onehot.unsqueeze(-1))  # [m, out]
+        if m < n:
+            d = F.pad(d, (0, 0, 0, n - m))  # pad rows keep the frozen base output
         return base_out + self._lora_scale * d
 
 
@@ -126,9 +138,9 @@ def build_gen_class_ids(
 ) -> Optional[torch.Tensor]:
     """Per-gen-token class-id vector in ``full_only_seq`` order (or ``None`` if unavailable).
 
-    Scatters each vision item's class id onto its packed rows (item -> owning sample -> class,
-    mirroring ``class_embed_addition``/``_apply_vision_prompt``), then reads them back in ascending
-    packed-row order — which equals ``full_only_seq`` order, since ``_full_indices`` is ascending.
+    Scatters each vision item's class id onto its packed rows (item -> owning sample -> class),
+    then reads them back in ascending packed-row order — which equals ``full_only_seq`` order,
+    since ``_full_indices`` is ascending.
     """
     if not isinstance(sequence_indexes, torch.Tensor) or sequence_indexes.numel() == 0 or not token_shapes:
         return None

@@ -27,10 +27,10 @@
     "id": "3",
     "question": "I just want to try AnomalyGen out on my workstation. What's the fastest way to get the container?",
     "expected_skill": "anomalygen-release",
-    "ground_truth": "Response checks whether a build is needed at all and directs the user to the prebuilt image on NGC — docker pull nvcr.io/nvidia/paidf-anomalygen:<tag> needs no login and no compile — rather than starting a >1 h source build. It reserves building for the cases that actually require it: a modified image, a target NGC does not publish, or an air-gapped bundle. If it goes on to describe running the image, it includes --shm-size (min 16g), noting the dataloader uses /dev/shm and Docker's 64 MB default causes bus errors or silent hangs.",
+    "ground_truth": "Response checks whether a build is needed at all and directs the user to the prebuilt image on NGC — docker pull nvcr.io/nvidia/cdf-anomalygen:<tag> needs no login and no compile — rather than starting a >1 h source build. It reserves building for the cases that actually require it: a modified image, a target NGC does not publish, or an air-gapped bundle. If it goes on to describe running the image, it includes --shm-size (min 16g), noting the dataloader uses /dev/shm and Docker's 64 MB default causes bus errors or silent hangs.",
     "expected_behavior": [
       "Response recommends pulling the prebuilt NGC image instead of building from source.",
-      "Response names nvcr.io/nvidia/paidf-anomalygen and notes it needs no login and no compile.",
+      "Response names nvcr.io/nvidia/cdf-anomalygen and notes it needs no login and no compile.",
       "Response does NOT start a >1 h source build for a plain try-it-out request.",
       "If run instructions are given, response includes --shm-size of at least 16g and explains why."
     ]

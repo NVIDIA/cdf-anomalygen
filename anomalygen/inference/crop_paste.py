@@ -9,33 +9,41 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+import math
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
-from anomalygen.data.utils import MASK_FG_THRESHOLD
+from anomalygen.configs.texture.constants import MIN_CROP_RATIO
+from anomalygen.data.crop_geometry import mask_bbox, place_window
+from anomalygen.data.utils import MASK_FG_THRESHOLD, require_same_size
 
+# Alpha ramp width in px for the paste-back seam, wide enough to hide it (see ``feathered_alpha``).
+# Chosen by visual inspection: no KPI measures seam visibility, so none of them separates candidates.
+# Every paste_back caller takes the default, so a change here moves every composite.
+DEFAULT_FEATHER_PX = 32.0
 
-def mask_bbox(mask: Image.Image) -> Tuple[int, int, int, int]:
-    """Tight ``(left, upper, right, lower)`` bounding box of the mask's foreground.
-
-    Raises ``ValueError`` on an empty mask, matching :func:`best_crop`.
-    """
-    arr = np.array(mask.convert("L")) if mask.mode != "L" else np.array(mask)
-    ys, xs = np.nonzero(arr >= MASK_FG_THRESHOLD)
-    if xs.size == 0 or ys.size == 0:
-        raise ValueError("No mask region found in input mask.")
-
-    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+# Ceiling on the ramp as a fraction of the crop. An approximation: the margin a centred mask has at
+# the tightest framing the planner cuts. An image-clamped window or an off-centre mask leaves less,
+# and the ramp can then meet the crop edge.
+MAX_FEATHER_CROP_FRACTION = (1.0 - 1.0 / MIN_CROP_RATIO) / 2.0
 
 
 def annotate(
-    image: Image.Image, mask: Image.Image, crop_offset: Tuple[int, int], crop_size: Tuple[int, int], label: str = ""
+    image: Image.Image,
+    mask: Image.Image,
+    crop_offset: Tuple[int, int],
+    crop_size: Tuple[int, int],
+    label: str = "",
+    bbox: Optional[Tuple[int, int, int, int]] = None,
 ) -> Image.Image:
-    """Draw the mask bbox (red) and crop window (green) on a copy of ``image``."""
-    lx, uy, rx, by = mask_bbox(mask)
+    """Draw the mask bbox (red) and crop window (green) on a copy of ``image``.
+
+    ``bbox`` is the mask's ``(left, upper, right, lower)``, scanned from the mask when not given.
+    """
+    lx, uy, rx, by = bbox or mask_bbox(mask)
     clx, cuy = crop_offset
     crx, cby = clx + crop_size[0], cuy + crop_size[1]
 
@@ -49,33 +57,26 @@ def annotate(
     return annotated.convert("RGB")
 
 
-def crop_grid_by_ratio(mask: Image.Image, crop_ratio: float) -> int:
-    """Square crop side for ``crop_ratio``: ``max(bbox_w, bbox_h) * crop_ratio``, at least 1."""
-    lx, uy, rx, by = mask_bbox(mask)
-    bbox = max(rx - lx + 1, by - uy + 1)
+def best_crop(
+    image: Image.Image,
+    mask: Image.Image,
+    grid_x: int,
+    grid_y: int,
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+):
+    """Crop a ``grid_x × grid_y`` window centered on the mask, clamped to bounds.
 
-    return max(1, int(bbox * crop_ratio))
-
-
-def best_crop(image: Image.Image, mask: Image.Image, grid_x: int = 512, grid_y: int = 512):
-    """Crop a ``grid_x × grid_y`` window centered on the mask's centroid, clamped to bounds.
-
+    ``bbox`` is the mask's ``(left, upper, right, lower)``, scanned from the mask when not given.
     Returns ``(cropped_image, cropped_mask, (upper_left_x, upper_left_y))``.
     """
-    binary_mask = np.array(mask.convert("L")) if mask.mode != "L" else np.array(mask)
-    ys, xs = np.nonzero(binary_mask >= MASK_FG_THRESHOLD)
-    if xs.size == 0 or ys.size == 0:
-        raise ValueError("No mask region found in input mask.")
+    require_same_size(image, mask, "the pair handed to best_crop")
+    lx, uy, rx, by = bbox or mask_bbox(mask)
 
-    lx, rx = int(xs.min()), int(xs.max())
-    uy, by = int(ys.min()), int(ys.max())
-    center_x = (lx + rx) // 2
-    center_y = (uy + by) // 2
-
-    h, w = binary_mask.shape
-    crop_lx = max(0, min(center_x - grid_x // 2, w - grid_x))
+    # Same placement rule as training, so a window that can hold the mask always does.
+    w, h = image.size
+    crop_lx = place_window(lx, rx, grid_x, w)
     crop_rx = min(w, crop_lx + grid_x)
-    crop_uy = max(0, min(center_y - grid_y // 2, h - grid_y))
+    crop_uy = place_window(uy, by, grid_y, h)
     crop_by = min(h, crop_uy + grid_y)
 
     cropped_image = image.crop((crop_lx, crop_uy, crop_rx, crop_by))
@@ -85,14 +86,18 @@ def best_crop(image: Image.Image, mask: Image.Image, grid_x: int = 512, grid_y: 
 
 
 def enlarge_mask(pil_mask: Image.Image) -> Image.Image:
-    """Replace each connected component with a disk of twice its inscribed radius.
+    """Replace each connected component with a disk of twice its min-enclosing-circle radius.
 
-    Softens the hard mask edge at paste time to avoid seams.
+    Enlarges; it does not soften — the result is binary. Beware elongated shapes: the enclosing
+    radius grows with the component's longest half-diagonal, so a thin line yields a disk that can
+    cover the whole crop. Used by ``paste_back``'s Poisson path.
     """
     if pil_mask.mode != "L":
         pil_mask = pil_mask.convert("L")
 
-    arr = np.array(pil_mask)
+    # Binarize first: masks may be anti-aliased, and contours off the raw grayscale would treat the
+    # soft skirt as foreground and inflate every radius.
+    arr = np.where(np.array(pil_mask) >= MASK_FG_THRESHOLD, 255, 0).astype(np.uint8)
     contours, _ = cv2.findContours(arr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     new_mask = np.zeros_like(arr)
     for contour in contours:
@@ -131,15 +136,18 @@ def paste_back(
     cropped_mask: Image.Image,
     offset: Tuple[int, int],
     poisson_blend: bool = False,
-    feather: float = 16.0,
+    feather: float = DEFAULT_FEATHER_PX,
 ) -> Image.Image:
     """Composite the model's edited crop back into the full image (out-of-place).
 
-    ``poisson_blend`` selects Poisson seamless cloning over the enlarged-disk mask (see
-    :func:`enlarge_mask`); otherwise the reconstruction is soft-blended with an alpha of the
-    *original* mask shape that is 1 across the whole mask and feathers outward only (see
-    :func:`feathered_alpha`), so every reconstructed pixel inside the contour is kept.
+    The reconstruction is soft-blended with an alpha of the *original* mask shape that is 1 across
+    the whole mask and ramps outward only (see :func:`feathered_alpha`), so every reconstructed pixel
+    inside the contour is kept and the seam is soft.
+
+    A per-testcase ``poisson_blend`` replaces that with Poisson seamless cloning over the enlarged
+    disk mask (see :func:`enlarge_mask`).
     """
+    require_same_size(cropped_image, cropped_mask, "the crop handed to paste_back")
     if recon_image.size != cropped_image.size:
         recon_image = recon_image.resize(cropped_image.size, Image.Resampling.BICUBIC)
 
@@ -163,6 +171,10 @@ def paste_back(
         blended = cv2.seamlessClone(np_recon, np_cropped, np_mask, (cx, cy), cv2.NORMAL_CLONE)
         tmp_cropped = Image.fromarray(blended).convert(image_mode)
     else:
+        # The ramp has to reach 0 inside the crop, or the composite steps at the border and the crop
+        # rectangle shows. Floored to whole pixels: the mask's own side is rounded, so the exact
+        # fraction can land a fraction of a pixel past the edge.
+        feather = min(feather, float(math.floor(MAX_FEATHER_CROP_FRACTION * min(cropped_image.size))))
         alpha = feathered_alpha(cropped_mask, feather)[..., None]  # [H,W,1]
         np_recon = np.array(recon_image.convert("RGB"), dtype=np.float32)
         np_cropped = np.array(tmp_cropped.convert("RGB"), dtype=np.float32)

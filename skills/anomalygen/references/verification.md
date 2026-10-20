@@ -4,20 +4,39 @@ Progressive-disclosure detail for the **Verification** section in the parent `SK
 step, named after the step (`dataset`, `amp`, `train`, `generate`, `eval`, `refine`, `label`) — run it
 before treating that step as done. If this file conflicts with `SKILL.md`, `SKILL.md` wins.
 
-Uses the shared vars set at the top of the SKILL.md step list (`${DATASET_DIR}`, `${GEN_DIR}`, `${OUT}`,
-`${NAME}`, `${TASK}`, `${NUM_SDG}`, `${NUM_SEARCH_RUN}`, `${AMP_DIR}`, `${RUN_DIR}`).
+Uses the shared vars set at the top of the SKILL.md step list (`${DATASET_DIR}`, `${VAL_DIR}`,
+`${GEN_DIR}`, `${OUT}`, `${NAME}`, `${TASK}`, `${NUM_SDG}`, `${NUM_SEARCH_RUN}`, `${AMP_DIR}`,
+`${RUN_DIR}`), plus `${MASK_BACKEND}` — the run's `mask_backend`, which the `dataset` gate branches on
+(unset ⇒ `amg`, the skill's default) and which selects gate **amg** or **amp** at Step 2. The `amg`
+gate holds each set to `${NUM_SDG}` — the same row-count rule as **amp**; both backends split that
+total by the same allocation.
 
 ## `dataset` — contract layout on disk (Step 1)
 
-Before anything else, `${DATASET_DIR}` must hold `defect_spec.jsonl` plus, per `[texture, defect]` pair,
+`${DATASET_DIR}` is whatever the caller passed to `set_pipeline_vars.sh --dataset_dir`; the script does
+no I/O, so **this gate is the first thing that touches the path at all**. A typo, a stale path or a
+dataset that was never staged surfaces here and nowhere earlier.
+
+Before anything else, `${DATASET_DIR}` must hold, per `[texture, defect]` pair,
 `{texture}/clean_image/`, `{texture}/anomaly_image/{defect}/`, and `{texture}/mask/{defect}/` (each mask
-is the anomaly's stem + `_mask`). `cad` defects also need `{texture}/cad_mask/<clean_stem>.png` — one
-per clean image, no `{defect}` level — plus `semantic_segmentation_labels.json`.
+is the anomaly's stem + `_mask`). `defect_spec.jsonl` is required **only when `mask_backend=amp`** —
+it is what allocate → pair → place routes on; the default `amg` never reads it (nor does any step
+after 2), so a dataset without one is complete under `amg`, not a failure. `cad` and `cad_tht`
+defects (an `amp` routing) also need `{texture}/cad_mask/<clean_stem>.png` — one per clean image, no
+`{defect}` level — plus `semantic_segmentation_labels.json`. For `cad_tht` each `cad_mask` must
+additionally be the **same size** as its clean image, and the label file must declare `pad`,
+`hole`, and a lead class — `pin_tip` or `pin`.
+
+Set `MASK_BACKEND` to the run's `mask_backend` first (it defaults to `amg`, matching the skill):
 
 ```shell
-test -f "${DATASET_DIR}/defect_spec.jsonl" \
-  && ls -d "${DATASET_DIR}"/*/clean_image "${DATASET_DIR}"/*/anomaly_image/*/ "${DATASET_DIR}"/*/mask/*/ >/dev/null 2>&1 \
-  && echo OK || echo "dataset not in contract layout"
+if [ "${MASK_BACKEND:-amg}" = amp ] && [ ! -f "${DATASET_DIR}/defect_spec.jsonl" ]; then
+  echo "dataset gate FAIL: mask_backend=amp requires ${DATASET_DIR}/defect_spec.jsonl"
+elif ls -d "${DATASET_DIR}"/*/clean_image "${DATASET_DIR}"/*/anomaly_image/*/ "${DATASET_DIR}"/*/mask/*/ >/dev/null 2>&1; then
+  echo OK
+else
+  echo "dataset not in contract layout"
+fi
 ```
 
 **The directories existing is not enough — check the pairing too.** The loader pairs each anomaly image
@@ -45,6 +64,42 @@ else echo "${miss}/${seen} anomaly image(s) with no mask — fix before training
 A missing dir or an unpaired `_mask` will otherwise surface as empty AMP placements or a
 training/scoring error later — fix the layout now.
 
+## `amg` — both mask sets delivered (Step 2, the default backend)
+
+Under `--num-sdg` (what `SKILL.md` Step 2 runs) AMG delivers **exactly `num_sdg` rows**, split across
+the types by the same rule AMP allocates by — so this is the same row-count check as the `amp` gate
+below, applied to every set the mode produced: `full` builds both, `finetune_only` only the validation
+set, `generation_only` only the generation set.
+
+```shell
+EXPECT="${NUM_SDG}"   # with --per-defect-counts instead: the SUM of that dict
+for d in "${VAL_DIR}" "${GEN_DIR}"; do    # finetune_only: VAL_DIR only · generation_only: GEN_DIR only
+  [ -f "$d/testcase.jsonl" ] || { echo "FAIL $d: no testcase.jsonl"; continue; }
+  rows=$(wc -l < "$d/testcase.jsonl")
+  [ "$rows" = "${EXPECT}" ] && echo "OK   $d: ${rows} rows" || echo "FAIL $d: ${rows} != ${EXPECT}"
+done
+# Both logs, because re-running only one set would leave the other's failure in place.
+grep -hoE 'degraded\[(type_failed|model_smoke_failed)[^]]*\]' "${LOG_DIR}"/amg_*_"${NAME}".log \
+  | sort | uniq -c | sort -rn
+```
+
+- **Rows = `num_sdg` exactly**, however the total divides: 25 over 3 types is 9/8/8, not 9 each.
+  Only a run sized with `--per-defect-counts` expects something else — that override's sum wins, and
+  is authoritative, exactly as AMP's `--per_defect_counts` is.
+- **More mask files on disk than rows is normal.** The fill loop delivers in beam-sized batches and
+  then trims to the target, logging `trimmed from N`; the surplus goes to
+  `{texture}/_overflow/{defect}/` + `testcase_overflow.jsonl` and is deliberately excluded from
+  `testcase.jsonl`. `N` well above a type's share is expected at small counts — count rows, not files.
+- **Short row count → re-run the same command, do NOT pass `--overwrite`.** Matching settings are the
+  resume switch: a re-run counts what is already delivered and produces only the shortfall.
+  `--overwrite` destroys the out-dir's masks and starts over, throwing away everything the run earned.
+- **`type_failed`** → a type delivered nothing; the run says why and already exited non-zero. Fix that
+  cause and re-run rather than proceeding with a short set — every downstream step is blind to which
+  types are missing.
+- **`model_smoke_failed`** → the capability probe rejected a model before the batch spent anything.
+  Fix the credential/model name; do not reach for `--skip-smoke`, which just moves the same failure
+  into the middle of the batch.
+
 ## `amp` — testcase built (Step 2)
 
 `roi_allocate`+`roi_pair` alone (just `allocation.json`+`amp_samples.json`) are **not** a finished AMP —
@@ -62,6 +117,21 @@ EXPECT="${NUM_SDG}"   # with --per_defect_counts: the SUM of that dict instead, 
   judging the gate.
 - **Fewer rows than `EXPECT`** → a defect lost placements (see *AMP short of allocation* in Common
   Pitfalls); check the `roi_place` logs and fix before generating.
+- **When every clean image must receive an output, the row count is not enough.** The diversity
+  pairing hits the right row count while reusing some clean images and skipping others, so count the
+  *distinct* ones too:
+
+  ```shell
+  DISTINCT=$(python3 -c \
+    'import json,sys; print(len({json.loads(l)["image_filename"] for l in sys.stdin if l.strip()}))' \
+    < "${GEN_DIR}/testcase.jsonl")
+  [ "${DISTINCT}" = "${EXPECT}" ] && echo OK || echo "AMP covered ${DISTINCT}/${EXPECT} joints"
+  ```
+
+  A shortfall means the run used the diversity pairing, which is the default. Report it and say that
+  `per_clean_pairing=on` is what covers every clean (`mask-placement.md`) — the option is the user's
+  to set, so do not re-run with it unasked. Only run this check when the batch has that requirement;
+  a validation set, and any batch whose cleans are a reusable pool, covers fewer by design.
 - **More rows than `EXPECT`** → most often **stale placed masks from an earlier AMP run** in a reused
   `--output_dir`: `roi_place` globs `*__seed*.png` back up, so leftovers from a previous call are
   counted as this one's. Clear `${AMP_DIR}` and re-run rather than adjusting `EXPECT`. Note rows =
@@ -98,7 +168,7 @@ images + blocked must equal the rows, and the CSV must carry the canonical heade
 
 ```shell
 BLOCKED=$([ -f "${OUT}/guardrail_blocked.csv" ] && echo $(( $(wc -l < "${OUT}/guardrail_blocked.csv") - 1 )) || echo 0)
-head -1 "${OUT}/${TASK}_generation_result.csv" | grep -q '^output_filename,image_filename,mask_filename,anomaly_type' \
+head -1 "${OUT}/${TASK}_generation_result.csv" | grep -Eq '^output_filename,image_filename,mask_filename,anomaly_type,.*,index\r?$' \
   && [ "$(( $(ls "${OUT}"/reconstructed_image/*.png | wc -l) + BLOCKED ))" = "$(wc -l < "${GEN_DIR}/testcase.jsonl")" ] \
   && echo "OK (${BLOCKED} guardrail-blocked)" || echo "generation partial/malformed — re-run Step 4"
 ```
@@ -109,8 +179,8 @@ failure: it is the guardrail doing its job, and those rows are simply absent fro
 `message` column before re-running, since a re-run reproduces the same block.
 
 A shortfall the blocked count does *not* explain, or a non-canonical header, means Step 4 didn't finish
-— **re-run it; never hand-write or patch the CSV** (a malformed `${TASK}_generation_result.csv` crashes
-Step 6 `quality_refine draw` with `KeyError: 'output_filename'`).
+— **re-run it; never hand-write or patch the CSV**. Step 6 reports a malformed
+`${TASK}_generation_result.csv` as an input error and stops before using incomplete history.
 
 ## `eval` — KPI computed (Step 5)
 
@@ -128,28 +198,39 @@ can also be complete on files *and* counts yet still be unrankable — see the `
 Run this after each round, and again before `select`:
 
 ```shell
-SCORE=nn        # must match --score on the Step 6 command; nn is the default
+: "${SCORE:?set SCORE to the exact value passed to Step 6 --score before running the refine gate}"
 fail=0
-rankable() {    # rankable <kpi.json> <key> -> True when any sample carries a non-NaN value
+rankable() {    # rankable <kpi.json> <score> -> True when the score's required inputs are usable
   python3 -c '
 import json, math, sys
 def ok(v):
-    try: return not math.isnan(float(v))
+    try: return math.isfinite(float(v))
     except (TypeError, ValueError): return False
 d = json.load(open(sys.argv[1]))
-print(any(ok(row.get(sys.argv[2])) for k, v in d.items()
-          if k != "Average" and isinstance(v, dict) for row in v.get("per_sample", [])))
+score = sys.argv[2]
+rows = [row for k, v in d.items() if k != "Average" and isinstance(v, dict)
+        for row in v.get("per_sample", [])]
+if score == "aq_rank":
+    required = ("nn_score", "completeness_score", "precision_score", "boundary_iou_score")
+    print(any(all(ok(row.get(key)) for key in required) for row in rows))
+else:
+    print(any(ok(row.get(f"{score}_score")) for row in rows))
 ' "$1" "$2" 2>/dev/null || echo False
 }
 
-# The ORIGINAL bucket competes against the rounds, so it must carry ${SCORE}_score too. Unranked, it
-# forfeits every pick — a round wins each sample even when strictly worse, and the run still exits 0.
-[ "$(rankable "${OUT}/${NAME}_kpi.json" "${SCORE}_score")" = True ] || {
-  echo "FAIL original: no usable ${SCORE}_score in ${OUT}/${NAME}_kpi.json"; fail=1; }
+# The ORIGINAL bucket competes against the rounds, so it must carry the selected score's inputs too.
+# AQ-Rank needs at least one candidate with every raw axis; invalid candidates are excluded.
+# With zero rounds no comparison occurs: select only clones Original, so this score gate is skipped.
+if [ "${NUM_SEARCH_RUN}" -gt 0 ] &&
+   [ "$(rankable "${OUT}/${NAME}_kpi.json" "${SCORE}")" != True ]; then
+  echo "FAIL original: required ${SCORE} inputs are unusable in ${OUT}/${NAME}_kpi.json"
+  fail=1
+fi
 
-n=$(ls -d "${OUT}"/rounds/round_* 2>/dev/null | wc -l)
-[ "$n" = "${NUM_SEARCH_RUN}" ] || { echo "only ${n}/${NUM_SEARCH_RUN} round dirs"; fail=1; }
-for r in "${OUT}"/rounds/round_*/; do
+n=$(seq 1 "${NUM_SEARCH_RUN}" | while read -r i; do [ -d "${OUT}/rounds/round_${i}" ] && echo "$i"; done | wc -l)
+[ "$n" = "${NUM_SEARCH_RUN}" ] || { echo "only ${n}/${NUM_SEARCH_RUN} requested round dirs"; fail=1; }
+for i in $(seq 1 "${NUM_SEARCH_RUN}"); do
+  r="${OUT}/rounds/round_${i}/"
   img=$(ls "$r"reconstructed_image/*.png 2>/dev/null | wc -l)
   row=$(wc -l < "$r"testcase.jsonl 2>/dev/null || echo 0)
   # Rounds run the same guardrail-enabled generate.py as Step 4, so a blocked sample writes no image
@@ -157,12 +238,12 @@ for r in "${OUT}"/rounds/round_*/; do
   # generate.py) reproduces the same block — the loop would never terminate.
   blk=$([ -f "$r"guardrail_blocked.csv ] && echo $(( $(wc -l < "$r"guardrail_blocked.csv) - 1 )) || echo 0)
   # Can this round actually be ranked? evaluate.py degrades to NN/MNN(+FID) whenever anomaly_quality
-  # raises, so with an aq_* metric the rows arrive complete but carry no ${SCORE}_score at all.
-  scored=$(rankable "$r"kpi.json "${SCORE}_score")
+  # raises, so an AQ/geometry mode can have complete artifacts but unusable score inputs.
+  scored=$(rankable "$r"kpi.json "${SCORE}")
   if [ -f "$r"kpi.json ] && [ "$(( img + blk ))" = "$row" ] && [ "$img" != 0 ] && [ "$scored" = True ]; then
-    echo "OK   $(basename $r): ${img}+${blk}/${row} images, kpi.json present, ${SCORE}_score usable"
+    echo "OK   $(basename $r): ${img}+${blk}/${row} images, kpi.json present, ${SCORE} inputs usable"
   else
-    echo "FAIL $(basename $r): ${img}+${blk}/${row} images, kpi.json $([ -f "$r"kpi.json ] && echo present || echo MISSING), ${SCORE}_score usable=${scored}"
+    echo "FAIL $(basename $r): ${img}+${blk}/${row} images, kpi.json $([ -f "$r"kpi.json ] && echo present || echo MISSING), ${SCORE} inputs usable=${scored}"
     fail=1
   fi
 done
@@ -173,20 +254,23 @@ done
   `evaluate.py`, then re-run `select` and Step 7. Do **not** accept the existing `searched/`: it was
   assembled without that round.
 - **Fewer round dirs than `${NUM_SEARCH_RUN}`** → rounds were skipped entirely.
-- **`${SCORE}_score usable=False`** → the round rendered fine but cannot be ranked, so re-running
-  `generate.py` fixes nothing. Only an `aq_*` metric hits this: `evaluate.py` degrades to
+- **`${SCORE} inputs usable=False`** → the round rendered fine but cannot be ranked, so re-running
+  `generate.py` fixes nothing. AQ/geometry metrics can hit this because `evaluate.py` degrades to
   NN/MNN(/FID) whenever `anomaly_quality` raises, and a **missing SAM2 checkpoint** at
   `checkpoints/facebook/sam2.1-hiera-large/` is the usual cause. Grep that round's evaluate log for
   `anomaly_quality computation failed`, fix the checkpoint, and re-run **`evaluate.py` only**. Left
   unchecked, every sample scores NaN, the original wins each pick, and the search burns its rounds
   to reproduce Step 4 exactly. `Step 6` itself now stops on this rather than exiting 0.
-- **`FAIL original: no usable ${SCORE}_score`** → the *original* bucket cannot be ranked, so it is
-  dropped from the competition and the best round wins every sample **with no magnitude comparison** —
-  the run exits 0 reporting `improved over original by search: N/N` and `search_summary.csv` carries an
-  empty `original_score` on every row. Same causes as above, plus a `${NAME}_kpi.json` scored before
-  `--score` accepted the `aq_*` metrics. Re-run **Step 5's `evaluate.py`** so the KPI carries
-  `${SCORE}_score`, then re-run Step 6. `quality_refine.py` now refuses this before the first round
-  rather than after the last, so no GPU time is spent on a search that was already decided.
+- **`FAIL original: required ${SCORE} inputs are unusable`** → the Original bucket cannot be compared
+  fairly with the rounds. Same causes as above, plus a `${NAME}_kpi.json` scored before the
+  anomaly-quality axes were available. Re-run **Step 5's `evaluate.py`** so the KPI carries the
+  score's required inputs, then re-run Step 6. `quality_refine.py` refuses this before the first
+  round, so no GPU time is spent on a search that was already decided.
+
+For `SCORE=aq_rank`, this shell gate checks that at least one KPI row has all four finite raw inputs.
+The built-in `quality_refine.py run` gate additionally logs and excludes individual invalid
+candidates, verifies that the generation CSV names exactly match the rendered images, and requires
+every generated candidate to join to a KPI row; do not bypass it.
 
 Also confirm `${OUT}/searched/${NAME}_kpi.json` exists (the closing evaluation).
 

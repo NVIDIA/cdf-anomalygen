@@ -301,7 +301,7 @@ class MaskAugmentor:
         self, roi_mask: np.ndarray, submask: np.ndarray, buffer_factor: float = 1.0
     ) -> Tuple[Tuple[int, int], Tuple[int, int]]:
         """Calculate dynamic shift range considering alignment points and ROI boundaries"""
-        y_coords, x_coords = np.where(roi_mask > 127)
+        y_coords, x_coords = np.nonzero(roi_mask > 127)
         if len(x_coords) == 0 or len(y_coords) == 0:
             return ((-1, 1), (-1, 1))
 
@@ -337,7 +337,7 @@ class MaskAugmentor:
 
     def calculate_dynamic_rotation_range(self, roi_mask: np.ndarray, submask: np.ndarray) -> Tuple[float, float]:
         """Calculate dynamic rotation range considering alignment-based overflow"""
-        y_coords, x_coords = np.where(roi_mask > 127)
+        y_coords, x_coords = np.nonzero(roi_mask > 127)
         if len(x_coords) == 0 or len(y_coords) == 0:
             return (-15.0, 15.0)
 
@@ -409,7 +409,7 @@ class MaskAugmentor:
         self, roi_mask: np.ndarray, submask: np.ndarray
     ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
         """Calculate dynamic shear range considering alignment-based overflow"""
-        y_coords, x_coords = np.where(roi_mask > 127)
+        y_coords, x_coords = np.nonzero(roi_mask > 127)
         if len(x_coords) == 0 or len(y_coords) == 0:
             return ((-5.0, 5.0), (-5.0, 5.0))
 

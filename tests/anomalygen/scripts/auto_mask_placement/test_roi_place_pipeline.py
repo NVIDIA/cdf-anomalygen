@@ -33,6 +33,7 @@ def _args(tmp_path, **over):
         mode="inference",
         seed=42,
         per_defect_counts=None,
+        per_clean_pairing="off",
         dry_run=False,
     )
     a.update(over)
@@ -177,3 +178,33 @@ def test_enumerate_amp_masks_rejects_a_path_bearing_defect_type(tmp_path):
     (tmp_path / "sample").mkdir()
     with pytest.raises(ValueError, match="anomaly type"):
         list(roi_place._enumerate_amp_masks(tmp_path, "../../escape+x"))
+
+
+def test_a_stage_message_reaches_the_caller(tmp_path, loguru_lines):
+    """A stage that exits with a string is telling the caller what to change; the wrapper must not eat it.
+
+    Dropping it leaves only "roi_pair exited 1 — stopping", which names the stage but not the cause,
+    and the pipeline is the documented way to run AMP — so the message would be reachable only by
+    re-running the stage by hand.
+    """
+    stages = _stages(tmp_path, raises=SystemExit("pass --per_clean_pairing off for a validation set"))
+    assert rpp._run(_args(tmp_path), [], stage_main=stages) == 1
+    assert any("--per_clean_pairing off" in line for line in loguru_lines)
+
+
+def test_a_bare_sys_exit_is_success(tmp_path):
+    """``sys.exit()`` carries code None, which is 0 by Python's convention, not a failure."""
+    stages = _stages(tmp_path, raises=SystemExit())
+    assert rpp._run(_args(tmp_path), [], stage_main=stages) == 1, "stage wrote nothing, so the artifact check fails"
+
+    complete = {k: [(f, "{}") for f, _ in v] for k, v in _FULL_RUN.items()}
+
+    def _exit_clean(argv):
+        out = tmp_path / "amp"
+        out.mkdir(parents=True, exist_ok=True)
+        for stage_files in complete.values():
+            for fname, body in stage_files:
+                (out / fname).write_text(body)
+        raise SystemExit()
+
+    assert rpp._run(_args(tmp_path), [], stage_main=dict.fromkeys(rpp._STAGE_MAIN, _exit_clean)) == 0

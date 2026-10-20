@@ -16,8 +16,11 @@ models; everything else takes the runner as a duck-typed argument.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
+import shutil
+import tempfile
 from typing import Any
 
 import nltk
@@ -72,19 +75,128 @@ def _read_guardrail_corpora_for_nltk() -> str | None:
     return entry
 
 
-def create_guardrail_runners(*, offload_model_to_cpu: bool = False) -> tuple[Any, Any]:
-    """Build the framework's ``(text, video)`` guardrail runners, nltk allowlist widened first.
+# Marker written into a materialised nltk_data copy before it is renamed into place, so a directory
+# without it is a copy that was interrupted mid-way and is rebuilt rather than trusted.
+_COMPLETE_MARKER = ".complete"
 
-    ``cosmos_framework`` is imported here rather than at module scope so this module stays
-    importable on CPU without pulling the framework in.
+
+def _nltk_data_cache_root() -> pathlib.Path:
+    """``$XDG_CACHE_HOME/anomalygen/nltk_data`` (``~/.cache`` when unset): per user, writable under
+    every deployment, including containers that run with ``HOME`` pointed at a scratch directory."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return pathlib.Path(base) / "anomalygen" / "nltk_data"
+
+
+def _has_symlinks(tree: pathlib.Path) -> bool:
+    return any(p.is_symlink() for p in tree.rglob("*"))
+
+
+def _copy_without_symlinks(src: pathlib.Path, dst: pathlib.Path) -> None:
+    shutil.copytree(src, dst, symlinks=False, dirs_exist_ok=True)
+    (dst / _COMPLETE_MARKER).touch()
+
+
+def _materialized_nltk_data(src: pathlib.Path) -> pathlib.Path:
+    """A symlink-free copy of ``src``, built once per source path.
+
+    Keyed by the resolved source path: an HF snapshot path carries the revision, so a new revision
+    gets a new copy and an unchanged one is reused. The copy is assembled in a sibling temp directory
+    and renamed into place, so concurrent ranks either win the rename or find a finished copy; the
+    marker distinguishes both from a copy that was interrupted. Falls back to a private temp
+    directory when the user cache cannot be written.
     """
+    src = src.resolve()
+    root = _nltk_data_cache_root()
+    dst = root / hashlib.sha256(str(src).encode()).hexdigest()[:16]
+    if (dst / _COMPLETE_MARKER).is_file():
+        return dst
+    tmp = None
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix=f"{dst.name}.tmp-", dir=root))
+        _copy_without_symlinks(src, tmp)
+    except OSError:
+        # The user cache cannot be written, before or during the copy: a private temp dir per process.
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+        fallback = pathlib.Path(tempfile.mkdtemp(prefix="anomalygen-nltk_data-")) / "nltk_data"
+        _copy_without_symlinks(src, fallback)
+        return fallback
+    try:
+        os.rename(tmp, dst)
+    except OSError as e:
+        # Another rank finished first; its copy is complete by construction, since the marker is written
+        # before the rename. A marker-less `dst` can only be hand-damaged: say so rather than reuse it.
+        shutil.rmtree(tmp, ignore_errors=True)
+        if not (dst / _COMPLETE_MARKER).is_file():
+            raise RuntimeError(f"{dst} exists without its {_COMPLETE_MARKER} marker; remove it and retry") from e
+    return dst
+
+
+def _dereference_guardrail_nltk_data(model_dir: str) -> list[str]:
+    """Shadow every guardrail ``nltk_data`` entry on ``nltk.data.path`` with a symlink-free copy.
+
+    nltk >= 3.10.3 opens data files with ``O_NOFOLLOW`` and refuses a final-component symlink (its
+    pathsec TOCTOU guard). The Hugging Face cache stores every file of a snapshot as a symlink into
+    ``blobs/``, so the punkt and wordnet data the framework's ``Blocklist`` registers from there are
+    unreadable in place. A copy with the links resolved, inserted just ahead of the original, is what
+    ``nltk.data.find`` reaches first; the original stays listed so the allowlist it grants is
+    unchanged. Only ``nltk_data`` directories below ``model_dir`` are touched — never ``model_dir``
+    itself, which :func:`_read_guardrail_corpora_for_nltk` lists as an allowlist root and which holds
+    the guardrail's model weights. Returns the copies inserted.
+    """
+    root = pathlib.Path(model_dir).resolve()
+    inserted: list[str] = []
+    for entry in list(nltk.data.path):
+        if not isinstance(entry, str):
+            continue
+        original = pathlib.Path(entry)
+        resolved = original.resolve()
+        if (
+            original.name != "nltk_data"
+            or resolved == root
+            or not resolved.is_relative_to(root)
+            or not original.is_dir()
+            or not _has_symlinks(original)
+        ):
+            continue
+        copy = str(_materialized_nltk_data(original))
+        if copy in nltk.data.path:
+            continue
+        nltk.data.path.insert(nltk.data.path.index(entry), copy)
+        inserted.append(copy)
+    return inserted
+
+
+def _is_real_nltk() -> bool:
+    """Whether ``nltk`` is the real package rather than ``assets/nltk_stub``. The stub reads the
+    checkpoint's data with plain file I/O, so only the real package needs the workarounds above."""
+    return not getattr(nltk, "IS_STUB", False)
+
+
+def create_guardrail_runners(*, offload_model_to_cpu: bool = False) -> tuple[Any, Any]:
+    """Build the framework's ``(text, video)`` guardrail runners. With the real nltk, widen its
+    allowlist first and shadow the symlinked corpora after the text runner registers them."""
     # Imported here, not at module scope, for the reason in the module docstring: this module stays
     # importable on CPU without pulling the framework in. ``log`` comes from the framework too.
     from cosmos_framework.auxiliary.guardrail.common import presets
     from cosmos_framework.utils import log
 
-    _read_guardrail_corpora_for_nltk()
+    real_nltk = _is_real_nltk()
+    if real_nltk:
+        _read_guardrail_corpora_for_nltk()
     text_guardrail = presets.create_text_guardrail_runner(offload_model_to_cpu=offload_model_to_cpu)
+    # After the text runner: building it downloads the guardrail and registers its nltk_data.
+    model_dir = _read_guardrail_corpora_for_nltk() if real_nltk else None
+    if model_dir is not None:
+        for copy in _dereference_guardrail_nltk_data(model_dir):
+            if pathlib.Path(copy).is_relative_to(_nltk_data_cache_root()):
+                log.info(f"[guardrail] nltk reads the blocklist corpora from a symlink-free copy: {copy}")
+            else:
+                log.warning(
+                    f"[guardrail] the user cache is not writable; nltk reads the blocklist corpora from a "
+                    f"per-process temp copy that is not removed at exit: {copy}"
+                )
     video_guardrail = presets.create_video_guardrail_runner(offload_model_to_cpu=offload_model_to_cpu)
     if not is_enforcing(video_guardrail):
         log.warning(

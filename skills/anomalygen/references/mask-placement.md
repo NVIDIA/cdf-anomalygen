@@ -1,8 +1,8 @@
 # Mask-placement reference — Step 2 (AMP)
 
-Progressive-disclosure detail for **Step 2 — auto mask placement** in the parent `SKILL.md`. Read this
-for allocation modes, the validation KPI floor, custom counts, ROI caching, and `spatial_dependency`
-routing. If this file conflicts with `SKILL.md`, `SKILL.md` wins.
+Progressive-disclosure detail for **Step 2 — mask placement**, `mask_backend=amp`, in the parent `SKILL.md`. Read this
+for allocation modes, the validation KPI floor, custom counts, ROI caching, `spatial_dependency`
+routing, and pairing coverage. If this file conflicts with `SKILL.md`, `SKILL.md` wins.
 
 ## Pipeline
 
@@ -35,8 +35,8 @@ CLI's, not the pipeline stage's, so don't reach for a `generation` mode; it does
 num_sdg // N` per type, then the first `num_sdg % N` types get **+1** (so a type is at most `base+1`,
 never `base+2`). Passing `--num_sdg N` alone yields a `testcase.jsonl` with exactly `N` rows. A different
 total is **not** a rounding effect: it means the call carried a `--per_defect_counts` override (whose sum
-wins) or a different `num_sdg`. (`validation` mode may exceed `num_sdg` slightly — its KPI floor forces
-≥1 per type.) After AMP, assert the generation set's `wc -l testcase.jsonl` against **whatever the
+wins) or a different `num_sdg`. (`validation` mode refuses a run in which a type's share would round to 0 —
+`validation coverage broken` — instead of delivering it.) After AMP, assert the generation set's `wc -l testcase.jsonl` against **whatever the
 allocation asked for** — `num_sdg` for a plain call, the override sum when `--per_defect_counts` was
 passed. Checking against `num_sdg` unconditionally fails correct custom-count runs.
 
@@ -59,11 +59,33 @@ Pass a JSON dict to set exact counts, e.g. `--per_defect_counts '{"Phone+oil": 5
 
 `roi_place` routes each defect by its `defect_spec` `spatial_dependency`:
 
-| Value  | Placement                                                                         | Extra inputs                                                                   |
-| ------ | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `free` | random ROI in the clean image (area-ratio bounded)                                | —                                                                              |
-| `text` | ROI grounded by a VLM (`--model_id`, default `nvidia/Cosmos3-Nano`) from a prompt | `roi_prompt_defect_location` per defect in `defect_spec`                       |
-| `cad`  | ROI from CAD / segmentation candidates                                            | `semantic_segmentation_labels.json` + `{texture}/cad_mask/<clean_stem>.png`    |
+| Value     | Placement                                                                                            | Extra inputs                                                                                                                         |
+| --------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `free`    | random ROI in the clean image (area-ratio bounded)                                                   | —                                                                                                                                    |
+| `text`    | ROI grounded by a VLM (`--model_id`, default `nvidia/Cosmos3-Nano`) from a prompt                    | `roi_prompt_defect_location` per defect in `defect_spec`                                                                             |
+| `cad`     | ROI from CAD / segmentation candidates                                                               | `semantic_segmentation_labels.json` + `{texture}/cad_mask/<clean_stem>.png`                                                          |
+| `cad_tht` | ROI from through-hole joint geometry CAD / segmentation candiates (pad ring / hole ring / lead face) | `semantic_segmentation_labels.json` + `{texture}/cad_mask/<clean_stem>.png`, whose classes are `pad`, `hole`, and `pin_tip` or `pin` |
+
+`cad` and `cad_tht` read the same two artefacts and differ only in what the classes mean. Routing is by
+this field.
+
+## Pairing coverage (`--per_clean_pairing`)
+
+The default pairing maximises **(submask, clean) diversity**, not coverage: it reuses some clean images
+and skips others, while still emitting the right number of records. Coverage is
+worst near `S = sqrt(num_sdg)`, so a larger submask bank makes it worse. That is the right trade when
+clean images are a reusable pool of backdrops, and the wrong one when each is a work item that must
+receive an output.
+
+`--per_clean_pairing on` switches to one record per clean; `off` (the default) is the round-robin.
+It is a user input (`inputs.md`), not something to decide here: which of the two a batch wants
+follows from what the clean images *are* — a pool of backdrops or a list of work items — and nothing
+in the dataset says which. Absent, the default applies.
+
+One record per clean means one defect per clean, so `on` needs **exactly one defect type with a
+non-zero allocation** — select it with `--per_defect_counts '{"<texture>+<defect>": N}'`. The
+allocation must fit the pool: larger than the clean count **raises**, smaller **warns** with the
+shortfall.
 
 ## ROI caching
 
@@ -76,7 +98,10 @@ on re-run; pass `--refresh_roi` to regenerate. `--roi_only` generates ROIs witho
 `roi_pair` writes the recommended `n_seeds` next to `amp_samples.json` (as `…json.n_seeds`).
 `roi_place_pipeline` passes it through automatically; only when running the stages by hand do you
 thread it yourself — `roi_place --n_seeds "$(cat …/amp_samples.json.n_seeds)"`. It is the per-sample
-placement multiplicity that makes the placed-mask count reach the allocation; don't hand-set it.
+placement multiplicity that makes the placed-mask count reach the allocation; leave it to the pipeline.
+
+Under `--per_clean_pairing on` it is **1**: each clean is used exactly once, so there is nothing for AMP
+multi-placement to make up.
 
 ## Preflight (`_validate_amp_inputs`)
 
@@ -88,7 +113,10 @@ fails with a list if any of these break:
 - a `text` defect missing a non-blank `roi_prompt_defect_location`,
 - a missing submask source dir (`{texture}/mask/{defect}/`),
 - no clean images,
-- for `cad`: missing `semantic_segmentation_labels.json`, or a clean without a matching `cad_mask`.
+- for `cad` and `cad_tht`: missing `semantic_segmentation_labels.json`, or a clean without a matching
+  `cad_mask`,
+- for `cad_tht`: a label file without `pad`, `hole` and a lead class, a `defect_type` outside
+  the published enum, or a `cad_mask` sized differently from its clean image.
 
 ## Outputs
 

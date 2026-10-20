@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Stand-in for the `nltk` package, limited to what cosmos-framework's guardrail blocklist calls.
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nltk-stub"
+version = "0.0.0"
+description = "Stand-in for `nltk` providing only the tokenizer and noun lemmatizer the guardrail blocklist uses."
+# The module ports NLTK code, so it ships NLTK's licence and the licence generator attributes it.
+license = "Apache-2.0"
+license-files = ["LICENSE.txt"]
+
+[project.urls]
+Source = "https://github.com/nltk/nltk"
+
+[tool.setuptools]
+packages = ["nltk"]

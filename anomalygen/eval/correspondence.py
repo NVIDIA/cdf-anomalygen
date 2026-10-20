@@ -102,7 +102,7 @@ def _extract_defect_features(
     x, mask_tensor, new_height, new_width = _image_mask_to_tensor(
         image_arr, mask_arr, patch_size=patch_size, mean=mean, std=std
     )
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = next(model.parameters()).device
     x = x.unsqueeze(0).to(device)  # [1, 3, H, W]
     mask_tensor = mask_tensor.to(device)  # [H, W]
 
@@ -164,7 +164,7 @@ def _crop_instance(
     """Square crop around one instance's bbox with ``pad_ratio``·side of context per side, clamped
     to the image then letterbox-padded back to square (so an elongated image doesn't stretch the
     crop), resized to ``(tgt, tgt)``. Returns (cropped_image, cropped_mask_uint8)."""
-    ys, xs = np.where(inst_bool)
+    ys, xs = np.nonzero(inst_bool)
     top, bottom, left, right = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
     bbox = max(bottom - top, right - left)  # defect side before padding
     height, width = inst_bool.shape
@@ -227,7 +227,7 @@ def _region_feature_sets(model, image_arr, mask_arr, region_policy, layer, patch
     if not crops:
         return []
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = next(model.parameters()).device
     x = torch.stack([TF.normalize(TF.to_tensor(crop), mean=mean, std=std) for crop, _ in crops]).to(device)  # [N,3,H,W]
     if layer == -1:
         tokens = model(pixel_values=x).last_hidden_state[:, 1:, :]  # [N, P, D]

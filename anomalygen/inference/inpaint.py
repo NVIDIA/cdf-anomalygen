@@ -5,17 +5,16 @@
 
 The reusable inference building blocks shared by the ``anomalygen/scripts/texture/generate.py`` CLI and the
 ``ValidationKPI`` callback: load the trained model, build a single-crop inpaint batch,
-generate, decode, and the ``build_inpaint_one`` closure the iterative orchestrator drives.
+generate, decode, and the ``build_inpaint_batch_fn`` closure the iterative orchestrator drives.
 """
 
 from __future__ import annotations
 
 import contextlib
 import glob
-import itertools
 import os
 import pathlib
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -23,24 +22,37 @@ from cosmos_framework.data.generator.sequence_packing import SequencePlan
 from cosmos_framework.inference.common.config import ROOT_DIR
 from cosmos_framework.utils import log
 from cosmos_framework.utils.generator.model_loader import load_model_from_checkpoint
-from hydra.core.config_store import ConfigStore
-from omegaconf import OmegaConf
 from PIL import Image
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
 
 import anomalygen  # noqa: F401  (registration side effects)
 from anomalygen.checkpoint.trained_keys import TRAINED_KEY_PREFIXES, WARM_START_SKIP_PREFIXES, match_keys
-from anomalygen.checkpoint.utils import verify_digest, verify_manifest
-from anomalygen.configs.loader import register_recipe
+from anomalygen.checkpoint.utils import (
+    GEOMETRY_STAMP_KEY,
+    pop_and_verify_geometry_stamp,
+    resolve_shift,
+    upgrade_legacy_state,
+    verify_digest,
+    verify_manifest,
+)
+from anomalygen.configs.loader import read_experiment_field, register_recipe
 from anomalygen.configs.texture.constants import (
     BASE_CHECKPOINT_PATHS,
-    DEFAULT_GUIDANCE,
     DEFAULT_MODEL_SIZE,
-    DEFAULT_NUM_STEPS,
-    DEFAULT_SHIFT,
     MODEL_SIZES,
 )
-from anomalygen.data.utils import MASK_FG_THRESHOLD, build_source_item, caption_for_anomaly_type
+from anomalygen.configs.texture.legacy import recipe_anomaly_types
+from anomalygen.data.crop_geometry import (
+    CropPlan,
+    fit_to_input_size,
+    resize_mask,
+)
+from anomalygen.data.utils import (
+    MASK_FG_THRESHOLD,
+    UNCONDITIONAL_CAPTION,
+    build_source_item,
+    caption_for_anomaly_type,
+)
 
 # Trained subset the fine-tuned .pt must contain, and the keys to skip when warm-starting the base
 # network. Shared with the optimizer / checkpointer (see trained_keys).
@@ -172,20 +184,29 @@ def _verify_base_weights(base_checkpoint: str) -> None:
     log.info(f"Base checkpoint integrity: {base.name} shards match {manifest.name}.")
 
 
+def _is_legacy(model_pt: str) -> bool:
+    """True when the fine-tuned ``.pt`` carries no geometry stamp: a legacy checkpoint."""
+    return GEOMETRY_STAMP_KEY not in torch.load(model_pt, map_location="cpu", weights_only=True, mmap=True)
+
+
 def load_finetuned_model(
     ft_checkpoint: str,
     base_checkpoint: Optional[str] = None,
     experiment: str = "anomalygen_texture_ft",
+    legacy_class_order: Optional[List[List[str]]] = None,
 ):
     """Load an anomalygen fine-tuned model saved by ``SelectiveCheckpointer``.
 
-    Those checkpoints hold only the trained subset (LoRA + ``inpaint_class_emb``), so this warm-starts
+    Those checkpoints hold only the trained subset (LoRA + ``text_prompt_emb``), so this warm-starts
     the full base network from ``base_checkpoint`` (skipping the keys absent from it), then overlays
     the trained subset from ``ft_checkpoint``'s flat ``.pt`` — the model-only half of
     ``SelectiveCheckpointer._load_filtered``. ``ft_checkpoint`` may be the run dir, its ``checkpoints/``,
     or the ``iter_<N>.pt`` directly. The experiment node must already be registered (see
     :func:`load_for_inference`, which registers it from a recipe and calls this).
     ``base_checkpoint`` defaults to the DCP matching that node's ``model_size``.
+
+    ``legacy_class_order`` is the recipe's ``anomaly_types`` listing for a legacy (unstamped)
+    checkpoint: the state is stamped and its classes reordered in memory before the overlay.
     """
     if base_checkpoint is None:
         base_checkpoint = _base_checkpoint_for_experiment(experiment)
@@ -199,7 +220,11 @@ def load_finetuned_model(
     model = load_model(base_checkpoint, experiment=experiment, keys_to_skip_loading=list(_BASE_SKIP_KEYS))
 
     log.info(f"Overlaying fine-tuned weights from {model_pt} onto base {base_checkpoint}.")
-    ckpt_model = torch.load(model_pt, map_location="cpu", weights_only=True)
+    ckpt_model = dict(torch.load(model_pt, map_location="cpu", weights_only=True))
+    if legacy_class_order is not None:
+        upgrade_legacy_state(ckpt_model, model, legacy_class_order, os.path.basename(model_pt))
+    # Generation has no dataset to scan: the per-class caps come from the checkpoint.
+    model.class_ladders = pop_and_verify_geometry_stamp(ckpt_model, model, os.path.basename(model_pt))
     full_state = get_model_state_dict(model)
     _verify_overlay(ckpt_model, full_state)
     full_state.update(ckpt_model)
@@ -215,8 +240,7 @@ def _base_checkpoint_for_experiment(experiment: str) -> str:
     Read off the built node, not the recipe file, so it covers both recipe forms the loader accepts
     (YAML/JSON file or Python module). The other size's DCP would load silently as wrong weights.
     """
-    node = ConfigStore.instance().repo["experiment"][f"{experiment}.yaml"].node
-    model_size = str(OmegaConf.select(node, "model.config.diffusion_expert_config.model_size") or DEFAULT_MODEL_SIZE)
+    model_size = str(read_experiment_field(experiment, "diffusion_expert_config.model_size") or DEFAULT_MODEL_SIZE)
     if model_size not in BASE_CHECKPOINT_PATHS:
         raise ValueError(f"Experiment {experiment!r} sets model_size={model_size!r}, not one of {MODEL_SIZES}.")
     return BASE_CHECKPOINT_PATHS[model_size]
@@ -232,19 +256,47 @@ def load_for_inference(
 
     Importing ``anomalygen`` only registers the reusable groups (model / ckpt_type / callbacks); the
     experiment node is registered here from ``recipe`` before the loader hydra-composes it. The
-    experiment name comes from the recipe; pass ``experiment`` only to override it (e.g. for a
-    Python-module recipe whose name :func:`register_recipe` can't surface). ``base_checkpoint``
-    defaults to the DCP matching the recipe's ``model_size``.
+    experiment name comes from the recipe; ``experiment`` overrides it, and picks the node when a
+    module recipe stores several. ``base_checkpoint`` defaults to the DCP matching the recipe's
+    ``model_size``.
+
+    A checkpoint with no geometry stamp is a legacy checkpoint. Its recipe (the run-dir copy) is then
+    read as a legacy recipe, and the checkpoint is stamped from it and reordered to the sorted class
+    ids in memory. Generation only: such a checkpoint cannot be resumed.
     """
-    name = register_recipe(recipe) or experiment
-    if name is None:
-        raise ValueError(
-            f"Recipe {recipe!r} did not yield an experiment name (a Python-module recipe?); "
-            "pass experiment=... explicitly."
+    model_pt = _resolve_ft_model_pt(ft_checkpoint)
+    legacy = _is_legacy(model_pt)
+    if legacy:
+        log.warning(
+            f"{model_pt} carries no geometry stamp (legacy checkpoint): {recipe} is read as a legacy recipe and "
+            "the checkpoint is stamped from it at load. Generation only; this checkpoint cannot be resumed."
         )
+    # Never shard the model for inference. Multi-GPU generation is data-parallel — each rank runs
+    # its own testcases with a full model copy — so sharding only adds parameter all-gathers. Their
+    # count follows each testcase's instance depth, which differs per rank, so the ranks fall out of
+    # step and the collective hangs. It also costs more memory per GPU than an unsharded copy.
+    #
+    # The builder reads this while register_recipe runs and bakes the choice into the model-group
+    # node, so it only has to hold across that call. Restored after: leaving it set would pin any
+    # experiment built later in the same interpreter to ddp.
+    previous = os.environ.get("ANOMALYGEN_PARALLELISM")
+    os.environ["ANOMALYGEN_PARALLELISM"] = "ddp"
+    try:
+        registered = register_recipe(recipe, experiment=experiment, legacy=legacy)
+    finally:
+        if previous is None:
+            os.environ.pop("ANOMALYGEN_PARALLELISM", None)
+        else:
+            os.environ["ANOMALYGEN_PARALLELISM"] = previous
+    name = experiment or registered
     if base_checkpoint is None:
         base_checkpoint = _base_checkpoint_for_experiment(name)
-    return load_finetuned_model(ft_checkpoint, base_checkpoint=base_checkpoint, experiment=name)
+    return load_finetuned_model(
+        model_pt,
+        base_checkpoint=base_checkpoint,
+        experiment=name,
+        legacy_class_order=recipe_anomaly_types(recipe) if legacy else None,
+    )
 
 
 def _load_conditioning(image: Image.Image, h: int, w: int, device, dtype) -> torch.Tensor:
@@ -271,10 +323,7 @@ def build_inpaint_batch(
     dtype = model.tensor_kwargs["dtype"]
     w, h = image.size
     cond = _load_conditioning(image, h, w, device, dtype)  # [3,1,H,W] clean (guide target)
-    m = (
-        torch.from_numpy(np.asarray(mask.convert("L").resize((w, h), Image.Resampling.NEAREST), dtype=np.float32))
-        >= MASK_FG_THRESHOLD
-    ).float()
+    m = (torch.from_numpy(np.asarray(resize_mask(mask, (w, h)), dtype=np.float32)) >= MASK_FG_THRESHOLD).float()
     m = m.to(device=device)  # [H,W]
 
     m3 = m[None, None].expand(cond.shape)  # [3,1,H,W]
@@ -294,9 +343,25 @@ def build_inpaint_batch(
         "edit_mask": m[None, None],  # [1,1,H,W]
         "anomaly_class_id": torch.tensor([int(class_id)], dtype=torch.long, device=device),
         model.input_caption_key: [caption],
+        # Key the framework reads when generate_samples_from_batch(has_negative_prompt=True).
+        "neg_" + model.input_caption_key: [UNCONDITIONAL_CAPTION],
     }
-
     return batch
+
+
+def _resolve_shift(model) -> float:
+    """The recipe's sampler time-shift: one scalar, shared by every input size.
+
+    The only source of a shift at inference, read off the ``--recipe`` the model was built from, so
+    there is nothing to override and no default to fall back to. Pass the recipe the checkpoint
+    trained under (the run-dir copy) or this silently samples on a different schedule.
+    """
+    shift = resolve_shift(model)
+    if shift is None:
+        raise AttributeError(
+            "recipe config has no rectified_flow_training_config.shift; cannot match the sampler to what training used."
+        )
+    return float(shift)
 
 
 def _build_inpaint_batch_multi(
@@ -320,7 +385,7 @@ def _build_inpaint_batch_multi(
         build_inpaint_batch(model, img, msk, cid, cap, seed=sd)
         for img, msk, cid, cap, sd in zip(images, masks, class_ids, captions, seeds)
     ]
-    return {
+    merged = {
         "dataset_name": "anomaly",
         "is_preprocessed": True,
         "images": [vi for s in singles for vi in s["images"]],
@@ -328,10 +393,20 @@ def _build_inpaint_batch_multi(
         "num_frames": [nf for s in singles for nf in s["num_frames"]],
         "num_vision_items_per_sample": [n for s in singles for n in s["num_vision_items_per_sample"]],
         "sequence_plan": [sp for s in singles for sp in s["sequence_plan"]],
-        "edit_mask": torch.cat([s["edit_mask"] for s in singles], dim=0),
+        # Stack only when every crop shares an input size; under variable-resolution generation they do not,
+        # and torch.cat would raise. A list is an accepted form here — model._per_item_pixel_masks
+        # takes either a list of per-sample tensors or a stacked [B,1,H,W].
+        "edit_mask": (
+            torch.cat([s["edit_mask"] for s in singles], dim=0)
+            if len({tuple(s["edit_mask"].shape[-2:]) for s in singles}) == 1
+            else [s["edit_mask"] for s in singles]
+        ),
         "anomaly_class_id": torch.cat([s["anomaly_class_id"] for s in singles], dim=0),
         model.input_caption_key: [c for s in singles for c in s[model.input_caption_key]],
     }
+    neg_key = "neg_" + model.input_caption_key
+    merged[neg_key] = [c for s in singles for c in s[neg_key]]
+    return merged
 
 
 def _decode_to_pil(model, vision_latent: torch.Tensor) -> Image.Image:
@@ -352,116 +427,68 @@ def _decode_to_pil(model, vision_latent: torch.Tensor) -> Image.Image:
     return Image.fromarray(arr)
 
 
-def _generate_inpaint(
-    model,
-    image: Image.Image,
-    mask: Image.Image,
-    class_id: int,
-    caption: str,
-    num_steps: int = DEFAULT_NUM_STEPS,
-    guidance: float = DEFAULT_GUIDANCE,
-    shift: float = DEFAULT_SHIFT,
-    seed: int = 1,
-) -> Image.Image:
-    """Inpaint a single crop and return the edited crop as a PIL image.
-
-    ``seed`` drives both noise streams: source conditioning and sampler latent.
-    """
-    batch = build_inpaint_batch(model, image, mask, class_id, caption, seed=seed)
-    out = model.generate_samples_from_batch(batch, guidance=guidance, num_steps=num_steps, shift=shift, seed=[seed])
-    return _decode_to_pil(model, out["vision"][0])
-
-
-@torch.inference_mode()
-def build_inpaint_one(
-    model,
-    class_ids: Dict[str, int],
-    num_steps: int,
-    guidance: float,
-    model_input_size: int = 512,
-    shift: float = DEFAULT_SHIFT,
-    seed: int = 1,
-):
-    """Build the ``(crop, crop_mask, name) -> edited_crop`` closure for the iterative
-    orchestrator. The crop is resized to ``model_input_size`` before generation;
-    ``paste_back`` resizes the result back to the crop's native size.
-
-    Seeds its n-th call with ``seed + n`` so a sample's instances don't share one noise draw; that
-    seed drives both noise streams, so output depends only on the call's own seed.
-    Stateful: build one closure per sample generation, never share it across samples.
-    """
-    instance_counter = itertools.count()
-
-    def inpaint_one(cropped_image: Image.Image, cropped_mask: Image.Image, anomaly_name: str) -> Image.Image:
-        # anomaly_name is data-driven (testcase JSONL "anomaly_type"); a typo or "{texture}+{defect}"
-        # format mismatch must fail loudly instead of silently generating with class 0.
-        if anomaly_name not in class_ids:
-            raise KeyError(f"Unknown anomaly_name {anomaly_name!r}; known: {sorted(class_ids)}")
-        cid = class_ids[anomaly_name]
-        caption = caption_for_anomaly_type(anomaly_name)
-
-        size = (model_input_size, model_input_size)
-        if cropped_image.size != size:
-            cropped_image = cropped_image.resize(size, Image.Resampling.BICUBIC)
-            cropped_mask = cropped_mask.resize(size, Image.Resampling.NEAREST)
-
-        return _generate_inpaint(
-            model,
-            cropped_image,
-            cropped_mask,
-            cid,
-            caption,
-            num_steps=num_steps,
-            guidance=guidance,
-            shift=shift,
-            seed=seed + next(instance_counter),
-        )
-
-    return inpaint_one
-
-
 @torch.inference_mode()
 def build_inpaint_batch_fn(
     model,
     class_ids: Dict[str, int],
     num_steps: int,
     guidance: float,
-    shift: float,
-    model_input_size: int = 512,
 ):
-    """Build a ``(crops, masks, names, seeds) -> edited_crops`` batched closure for the iterative driver.
+    """Build a ``(crops, masks, names, seeds, plans) -> edited_crops`` batched closure for the
+    iterative driver. Each crop is fitted to the plan the orchestrator passes in — the geometry is
+    not recoverable from the cut alone — and handed back at its native size, so ``paste_back`` gets
+    an exact paste. Returns one edited crop (PIL) per input crop.
 
-    Crops are resized to ``model_input_size`` before generation. ``guidance``/``num_steps``/``shift``
-    are batch-level scalars (the caller guarantees the batch is homogeneous in ``(guidance, shift)``);
-    ``seeds`` is one seed per crop, driving both its noise streams, so results are invariant to
-    batch composition. Returns one edited crop (PIL) per input crop.
+    ``guidance``/``num_steps`` are batch-level scalars (the caller guarantees the batch is
+    homogeneous in ``guidance``); ``seeds`` is one seed per crop, driving both its noise streams, so
+    results are invariant to batch composition.
     """
-    size = (model_input_size, model_input_size)
+    step_shift = _resolve_shift(model)
 
     def fn(
         crops: List[Image.Image],
         masks: List[Image.Image],
         names: List[str],
         seeds: List[int],
+        plans: List[CropPlan],
     ) -> List[Image.Image]:
         cids: List[int] = []
         caps: List[str] = []
         rc: List[Image.Image] = []
         rm: List[Image.Image] = []
-        for img, msk, name in zip(crops, masks, names):
+        natives: List[Tuple[int, int]] = []
+        boxes: List[Optional[Tuple[int, int, int, int]]] = []
+        for i, (img, msk, name) in enumerate(zip(crops, masks, names)):
+            # anomaly_name is data-driven (testcase JSONL "anomaly_type"); a typo or a format mismatch
+            # must fail loudly instead of silently generating with class 0.
             if name not in class_ids:
                 raise KeyError(f"Unknown anomaly_name {name!r}; known: {sorted(class_ids)}")
             cids.append(class_ids[name])
             caps.append(caption_for_anomaly_type(name))
-            if img.size != size:
-                img = img.resize(size, Image.Resampling.BICUBIC)
-                msk = msk.resize(size, Image.Resampling.NEAREST)
+            natives.append(img.size)
+            img, msk, box = fit_to_input_size(img, msk, plans[i])
+            boxes.append(box)
             rc.append(img)
             rm.append(msk)
+
         batch = _build_inpaint_batch_multi(model, rc, rm, cids, caps, seeds=[int(s) for s in seeds])
         out = model.generate_samples_from_batch(
-            batch, guidance=guidance, num_steps=num_steps, shift=shift, seed=list(seeds)
+            batch,
+            guidance=guidance,
+            num_steps=num_steps,
+            shift=step_shift,
+            seed=list(seeds),
+            has_negative_prompt=True,
         )
-        return [_decode_to_pil(model, out["vision"][i]) for i in range(len(crops))]
+
+        outs: List[Image.Image] = []
+        for i in range(len(crops)):
+            o = _decode_to_pil(model, out["vision"][i])
+            if boxes[i] is not None:
+                o = o.crop(boxes[i])
+            if o.size != natives[i]:
+                o = o.resize(natives[i], Image.Resampling.BICUBIC)
+            outs.append(o)
+        return outs
 
     return fn

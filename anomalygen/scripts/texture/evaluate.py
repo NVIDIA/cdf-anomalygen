@@ -27,7 +27,9 @@ import os
 from cosmos_framework.inference.common.init import init_script
 from cosmos_framework.utils import log
 
-init_script(training=False)
+# Guarded because it disables autograd process-wide; importing this module must leave it alone.
+if __name__ == "__main__":
+    init_script(training=False)
 
 from anomalygen.eval.anomaly_quality import augment_with_quality, compute_anomaly_quality_kpi
 from anomalygen.eval.correspondence import add_nn_scoring_args, compute_correspondence_kpi, nn_scoring_kwargs
@@ -107,8 +109,10 @@ def main(argv=None) -> None:
         log.warning(f"anomaly_quality computation failed ({e}); writing the KPI without the quality axes.")
         aq = {}
     if aq:
-        # Per-sample first: this folds each axis (+ aq_nn_score / aq_rank_score) into the existing
-        # per_sample rows, so downstream rankers read one row per sample rather than joining twice.
+        # Per-sample first: this folds each axis (+ aq_nn_score / bucket-local aq_rank_score) into the
+        # existing rows, so downstream rankers read one row per sample rather than joining twice.
+        # quality_refine's aq_rank mode ignores that local rank and recomputes from these raw inputs
+        # over Original + observed rounds; filter.py intentionally ranks this one bucket as written.
         augment_with_quality(kpi, aq)
         for name, vals in aq.items():
             # per_sample_axes is already merged into per_sample above; keeping it would duplicate

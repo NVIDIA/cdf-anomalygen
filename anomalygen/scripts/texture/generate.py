@@ -3,10 +3,9 @@
 
 """Standalone (optionally multi-GPU) synthetic-data-generation over a JSONL of testcases.
 
-Ported from cosmos-anomalygen ``synthetic_dataset_generation.py``, reusing this repo's
-generation backend (``inpaint`` + ``iterative`` + ``crop_paste``). Reads a JSONL, sorts by
-mask instance count, splits work round-robin across ranks, generates each sample, and writes
-an output tree + ``texture_ft_generation_result.csv`` + ``timing_summary.json``.
+Built on this repo's generation backend (``inpaint`` + ``iterative`` + ``crop_paste``). Reads a
+JSONL, sorts by mask instance count, splits work round-robin across ranks, generates each sample,
+and writes an output tree + ``texture_ft_generation_result.csv`` + ``timing_summary.json``.
 
 Content-safety guardrail (Cosmos 3 parity, on by default; pass ``--no-guardrail`` to disable):
 each sample's caption is screened by the text guardrail (Blocklist + Qwen3Guard) before generation,
@@ -47,7 +46,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 import numpy as np
-import omegaconf
 import PIL
 import PIL.Image
 
@@ -64,7 +62,10 @@ os.environ.setdefault(
 # Must run before the heavy imports below, mirroring anomalygen/scripts/texture/train.py.
 from cosmos_framework.inference.common.init import init_script  # noqa: E402
 
-init_script(training=False)
+# Guarded because it disables autograd process-wide: torchrun and `python generate.py` both run this
+# as __main__, so the CLI is unaffected, while importing the module leaves the process alone.
+if __name__ == "__main__":
+    init_script(training=False)
 
 
 import torch.distributed as dist  # noqa: E402
@@ -76,14 +77,14 @@ from anomalygen.configs.texture.constants import (  # noqa: E402
     DEFAULT_GUIDANCE,
     DEFAULT_MAX_INSTANCES,
     DEFAULT_NUM_STEPS,
-    DEFAULT_SHIFT,
 )
+from anomalygen.data.crop_geometry import clamp_crop_ratio, input_size_spec_from_config  # noqa: E402
 from anomalygen.data.inpaint_inference_dataset import (  # noqa: E402
     SEED_OUTPUT_STRIDE,
     SEED_RECORD_STRIDE,
     InpaintInferenceDataset,
 )
-from anomalygen.data.utils import caption_for_anomaly_type  # noqa: E402
+from anomalygen.data.utils import anomaly_class_ids, caption_for_anomaly_type  # noqa: E402
 from anomalygen.inference.guardrail import (  # noqa: E402
     BLOCKED_CSV_HEADER,
     blocked_row,
@@ -91,8 +92,8 @@ from anomalygen.inference.guardrail import (  # noqa: E402
     guard_image,
     is_enforcing,
 )
-from anomalygen.inference.inpaint import build_inpaint_one, load_for_inference  # noqa: E402
-from anomalygen.inference.iterative import run_iterative_inpaint  # noqa: E402
+from anomalygen.inference.inpaint import build_inpaint_batch_fn, load_for_inference  # noqa: E402
+from anomalygen.inference.iterative import run_iterative_inpaint_batch  # noqa: E402
 
 CSV_HEADER = [
     "output_filename",
@@ -103,7 +104,6 @@ CSV_HEADER = [
     "num_steps",
     "seed",
     "num_generated_images",
-    "crop_and_paste",
     "crop_ratio",
     "poisson_blend",
     "PSNR",
@@ -111,16 +111,16 @@ CSV_HEADER = [
 ]
 
 # Subdirs written per output, mirroring the other repo's tree. Artifact subdirs come from
-# run_iterative_inpaint's artifacts dict (cropped_image / cropped_mask / annotated_image / ...).
+# run_iterative_inpaint_batch's artifacts dict (cropped_image / cropped_mask / annotated_image / ...).
 _RECON_SUBDIR = "reconstructed_image"
 _ORIG_IMAGE_SUBDIR = "original_image"
 _ORIG_MASK_SUBDIR = "original_mask"
 
 
 # --- Distributed work-splitting and result-merging ---------------------------------------------
-# Ported from cosmos-anomalygen ``distributed_inference_utils``. Process-group setup is handled by
-# ``init_script`` above, so these are pure helpers: round-robin work assignment, the per-sample
-# output plan (stable ids that survive the instance-sort and the rank split), and the rank-0 merges.
+# Process-group setup is handled by ``init_script`` above, so these are pure helpers: round-robin
+# work assignment, the per-sample output plan (stable ids that survive the instance-sort and the
+# rank split), and the rank-0 merges.
 
 
 @dataclass(frozen=True)
@@ -191,32 +191,20 @@ def _require_collectives(world_size: int) -> bool:
     return True
 
 
-def _merge_rank_rows(rows: list[dict], world_size: int) -> list[list]:
-    """Gather per-rank CSV rows (each ``{"sort_key": [...], "row": [...]}``) and return them
-    merged and ordered by ``sort_key``. No-op pass-through on a single GPU."""
-
-    def _merge_gathered_rank_rows(gathered_rows: list[list[dict]]) -> list[list]:
-        merged_rows: list[dict] = []
-        for rank_rows in gathered_rows:
-            merged_rows.extend(rank_rows)
-        merged_rows.sort(key=lambda item: tuple(item["sort_key"]))
-        return [row["row"] for row in merged_rows]
-
-    payload = [_to_json_safe(row) for row in rows]
-    if not _require_collectives(world_size):
-        return _merge_gathered_rank_rows([payload])
-    return _merge_gathered_rank_rows(distributed.all_gather_object(payload))
-
-
-def _merge_rank_timings(timing: dict, world_size: int) -> list[dict]:
-    """Gather per-rank timing dicts and return them sorted by rank. No-op on a single GPU."""
-    payload = _to_json_safe(timing)
+def gather_from_ranks(obj, world_size: int) -> list:
+    """Every rank's ``obj`` as a list in rank order; ``[obj]`` on a single GPU, with no collective.
+    JSON-safe copies on both sides, so numpy scalars pickle and land as plain numbers."""
+    payload = _to_json_safe(obj)
     if not _require_collectives(world_size):
         return [payload]
+    return [_to_json_safe(item) for item in distributed.all_gather_object(payload)]
 
-    merged = [_to_json_safe(t) for t in distributed.all_gather_object(payload)]
-    merged.sort(key=lambda item: int(item.get("rank", 0)))
-    return merged
+
+def _merge_rank_rows(gathered: list[list[dict]]) -> list[list]:
+    """Flatten gathered per-rank CSV rows (each ``{"sort_key": [...], "row": [...]}``), ordered by ``sort_key``."""
+    merged = [row for rank_rows in gathered for row in rank_rows]
+    merged.sort(key=lambda item: tuple(item["sort_key"]))
+    return [row["row"] for row in merged]
 
 
 def _aggregate_rank_timings(rank_timings: list[dict]) -> dict:
@@ -260,14 +248,6 @@ def _aggregate_rank_timings(rank_timings: list[dict]) -> dict:
     return summary
 
 
-def _crop_settings(rec: dict, default_crop: int):
-    """Resolve a record's crop fields into (crop_grid, crop_ratio) for run_iterative_inpaint.
-    crop_ratio (when set) sizes the window dynamically; otherwise a fixed default square grid is used."""
-    crop_ratio = rec.get("crop_ratio")
-    crop_ratio = None if crop_ratio in (None, "none", "None", "") else float(crop_ratio)
-    return (default_crop, default_crop), crop_ratio
-
-
 def _psnr_in_mask(original: PIL.Image.Image, recon: PIL.Image.Image, mask: PIL.Image.Image):
     """PSNR (dB) between original and reconstructed image, restricted to the mask region."""
     orig = np.asarray(original.convert("RGB"), dtype=np.float32)
@@ -276,7 +256,7 @@ def _psnr_in_mask(original: PIL.Image.Image, recon: PIL.Image.Image, mask: PIL.I
     if not m.any():
         return None
     mse = float(np.mean((orig[m] - rec[m]) ** 2))
-    if mse == 0.0:
+    if mse <= 0.0:
         return 100.0
     return float(20.0 * np.log10(255.0) - 10.0 * np.log10(mse))
 
@@ -285,32 +265,6 @@ def _save(img: PIL.Image.Image, out_dir: str, subdir: str, filename: str) -> Non
     d = os.path.join(out_dir, subdir)
     os.makedirs(d, exist_ok=True)
     img.save(os.path.join(d, filename), compress_level=1)
-
-
-def _resolve_class_ids(args) -> dict:
-    """``{"texture+defect": class_id}`` from --class_ids_json (mapping or [t,d] list) or the recipe's
-    ``anomaly_types`` (same positional construction as the training config)."""
-    if args.class_ids_json:
-        with open(args.class_ids_json, "r") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return {str(k): int(v) for k, v in data.items()}
-        if isinstance(data, list):
-            return {f"{t}+{d}": i for i, (t, d) in enumerate(data)}
-        raise ValueError(
-            f"--class_ids_json must hold a mapping or a list of [texture, defect] pairs, got {type(data)}."
-        )
-
-    if args.recipe and args.recipe.lower().endswith((".yaml", ".yml", ".json")):
-        data = omegaconf.OmegaConf.to_container(omegaconf.OmegaConf.load(args.recipe), resolve=True)
-        anomaly_types = data.get("anomaly_types") if isinstance(data, dict) else None
-        if not anomaly_types:
-            raise ValueError(f"Recipe {args.recipe} has no 'anomaly_types'; pass --class_ids_json instead.")
-        return {f"{t}+{d}": i for i, (t, d) in enumerate(anomaly_types)}
-
-    raise ValueError(
-        "Cannot resolve class ids: pass --class_ids_json, or a YAML/JSON --recipe containing 'anomaly_types'."
-    )
 
 
 # Room the noise-seed strides leave per testcase / per output (see inpaint_inference_dataset:
@@ -365,11 +319,8 @@ def main(argv=None) -> None:
     parser.add_argument(
         "--recipe",
         default="ag_config/exp_texture_ft_phone_screen.yaml",
-        help="experiment recipe (YAML/JSON): registers the experiment node and supplies the "
-        "anomaly_type->class_id mapping from its 'anomaly_types'",
-    )
-    parser.add_argument(
-        "--class_ids_json", default=None, help="explicit class-id mapping; overrides --recipe derivation"
+        help="the recipe the checkpoint trained under (YAML/JSON file or ag_config module): it builds the "
+        "model config, whose anomaly_types give the class ids; the checkpoint's stamp must match it",
     )
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument(
@@ -390,9 +341,6 @@ def main(argv=None) -> None:
         "skips and batch composition. Same value reproduces, up to GPU kernel nondeterminism; "
         "bump it to re-roll the noise",
     )
-    parser.add_argument("--crop", type=int, default=512, help="fallback square crop grid")
-    parser.add_argument("--model_input_size", type=int, default=512)
-    parser.add_argument("--shift", type=float, default=DEFAULT_SHIFT, help="sampler time-shift")
     parser.add_argument(
         "--guardrail",
         action=argparse.BooleanOptionalAction,
@@ -410,7 +358,6 @@ def main(argv=None) -> None:
     rank = distributed.get_rank()
     world_size = distributed.get_world_size()
 
-    class_ids = _resolve_class_ids(args)
     dataset = InpaintInferenceDataset(
         args.input_data_path,
         default_guidance=args.guidance,
@@ -438,6 +385,10 @@ def main(argv=None) -> None:
     model_init_start = time.time()
     model = load_for_inference(args.recipe, args.checkpoint, base_checkpoint=args.base_checkpoint)
     model_init_seconds = time.time() - model_init_start
+    # Class ids and geometry come off the loaded model config, which the checkpoint's stamp was just
+    # checked against. Both are constant for the run, so they are read once here.
+    class_ids = anomaly_class_ids(model.config.diffusion_expert_config.anomaly_types)
+    input_spec = input_size_spec_from_config(model.config.diffusion_expert_config, class_ladders=model.class_ladders)
 
     guardrail_init_start = time.time()
     text_guardrail = video_guardrail = None
@@ -471,6 +422,7 @@ def main(argv=None) -> None:
     # a 0.6B LLM per call, so cache each caption's verdict to avoid redundant text checks within a run.
     text_verdicts: dict[str, tuple[bool, str]] = {}
     generated_images = 0
+    clamped_testcases = 0
     for rec in loader:
         plan = plans[int(rec["index"])]
         anomaly_type = rec["anomaly_type"]
@@ -492,8 +444,12 @@ def main(argv=None) -> None:
                 )
                 continue
 
-        crop_grid, crop_ratio = _crop_settings(rec, args.crop)
-        csv_ratio = crop_ratio if crop_ratio is not None else "none"
+        # Validated by InpaintInferenceDataset. Clamped into the trained band here, not only inside the
+        # planner, so the CSV records the value generation used and out-of-band requests are counted.
+        requested_crop_ratio = float(rec["crop_ratio"])
+        crop_ratio = clamp_crop_ratio(requested_crop_ratio, input_spec)
+        if crop_ratio != requested_crop_ratio:
+            clamped_testcases += 1
 
         # Per-sample generation params (invariant across the num_outputs loop; only seed varies).
         num_outputs = int(rec["num_generated_images"])
@@ -502,33 +458,26 @@ def main(argv=None) -> None:
         guidance = float(rec["guidance"])
         max_instances = int(rec["iteration_generation_max_instance"])
         poisson_blend = bool(rec["poisson_blend"])
-        crop_and_paste = bool(rec["crop_and_paste"])
 
+        # One image per call through the batch orchestrator, the path validation runs too; depth j of
+        # the sample is seeded ``seed + j``, so its instances never share a noise draw.
+        inpaint_batch = build_inpaint_batch_fn(model, class_ids, num_steps=num_steps, guidance=guidance)
         for i in range(num_outputs):
             output_idx = plan.anomaly_offset + i
-            # Strided so build_inpaint_one's per-instance offsets can't reach the next output.
+            # Strided so the per-instance seed offsets can't reach the next output.
             seed = record_seed + i * SEED_OUTPUT_STRIDE
-            inpaint_one = build_inpaint_one(
-                model,
-                class_ids,
-                num_steps=num_steps,
-                guidance=guidance,
-                model_input_size=args.model_input_size,
-                shift=args.shift,
-                seed=seed,
+            composites, all_artifacts = run_iterative_inpaint_batch(
+                [image],
+                [mask],
+                [anomaly_type],
+                inpaint_batch,
+                seeds=[seed],
+                crop_ratios=[crop_ratio],
+                poisson_blends=[poisson_blend],
+                max_instances_list=[max_instances],
+                input_spec=input_spec,
             )
-            composite, artifacts = run_iterative_inpaint(
-                image=image,
-                mask=mask,
-                anomaly_name=anomaly_type,
-                model_inpaint=inpaint_one,
-                crop_grid=crop_grid,
-                max_instances=max_instances,
-                poisson_blend=poisson_blend,
-                crop_and_paste=crop_and_paste,
-                crop_ratio=crop_ratio,
-                return_artifacts=True,
-            )
+            composite, artifacts = composites[0], all_artifacts[0]
 
             # Guard only the final composite (the shipped deliverable). original_image/original_mask
             # are user inputs, and the artifacts saved below are internal debug views — left unguarded.
@@ -575,8 +524,7 @@ def main(argv=None) -> None:
                         "num_steps": rec["num_steps"],
                         "seed": seed,
                         "num_generated_images": num_outputs,
-                        "crop_and_paste": rec["crop_and_paste"],
-                        "crop_ratio": csv_ratio,
+                        "crop_ratio": crop_ratio,
                         "poisson_blend": rec["poisson_blend"],
                         "PSNR": psnr,
                         "index": rec["index"],
@@ -588,7 +536,14 @@ def main(argv=None) -> None:
     generation_seconds = time.time() - gen_start
 
     finalize_start = time.time()
-    merged_rows = _merge_rank_rows(rows, world_size)
+    merged_rows = _merge_rank_rows(gather_from_ranks(rows, world_size))
+    clamped_total = sum(gather_from_ranks(clamped_testcases, world_size))
+    if distributed.is_rank0() and clamped_total:
+        lo, hi = input_spec.crop_ratio_range
+        log.warning(
+            f"{clamped_total} testcase(s) asked for a crop_ratio outside the trained band [{lo:g}, {hi:g}]; "
+            "they were generated at the nearest edge, which is the value the CSV records."
+        )
     if distributed.is_rank0():
         csv_path = os.path.join(args.output_dir, "texture_ft_generation_result.csv")
         with open(csv_path, "w", newline="") as f:
@@ -597,7 +552,7 @@ def main(argv=None) -> None:
             writer.writerows(merged_rows)
         log.info(f"Wrote {len(merged_rows)} rows to {csv_path}.")
 
-    merged_blocked = _merge_rank_rows(blocked, world_size)
+    merged_blocked = _merge_rank_rows(gather_from_ranks(blocked, world_size))
     if distributed.is_rank0() and args.guardrail:
         blocked_path = os.path.join(args.output_dir, "guardrail_blocked.csv")
         with open(blocked_path, "w", newline="") as f:
@@ -623,7 +578,7 @@ def main(argv=None) -> None:
         "guardrail_init_seconds": guardrail_init_seconds,
         "guardrail_seconds": guardrail_seconds,
     }
-    merged_timings = _merge_rank_timings(timing, world_size)
+    merged_timings = sorted(gather_from_ranks(timing, world_size), key=lambda t: int(t.get("rank", 0)))
     if distributed.is_rank0():
         summary = _aggregate_rank_timings(merged_timings)
         with open(os.path.join(args.output_dir, "timing_summary.json"), "w") as f:

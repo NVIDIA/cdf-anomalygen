@@ -4,8 +4,9 @@
 #
 # train_control.sh — launch an AnomalyGen fine-tune that outlives the shell, and wait for it in slices.
 #
-# A fine-tune runs ~1 h at max_iter=5000 and ~4 h at the 15000 default: far longer than one foreground
-# command, so it is launched detached with a PID file and a log, then polled.
+# A fine-tune runs for hours at the 15000 default (dataset-dependent; measured times are in
+# docs/tutorial/texture/7-agentic-end-to-end-flow.md): far longer than one foreground command, so it is
+# launched detached with a PID file and a log, then polled.
 #
 #   scripts/skill_utility/train_control.sh start --name phone_screen --recipe ag_config/exp_texture_ft_phone_screen.yaml
 #   scripts/skill_utility/train_control.sh wait  --name phone_screen        # repeat until it stops exiting 2
@@ -18,7 +19,7 @@
 #   1  failed      the log holds a traceback, or the process died without the marker
 #   2  running     the slice elapsed with the run healthy  -> call 'wait' again, as many times as it takes
 #
-# Exit 2 is the normal case for most of a run: at ~9.5 min a slice, the 15000 default takes ~25 of them.
+# Exit 2 is the normal case for most of a run: at ~9.5 min a slice, the 15000 default takes dozens of them.
 # A checkpoint appearing is NOT the finish line — the trainer writes one every save_iter and all but the
 # last are intermediate. Gate on exit 0.
 #
@@ -38,7 +39,8 @@ usage() {
 }
 
 die() {
-  printf 'train_control.sh: %s\n' "$1" >&2
+  local msg="$1"
+  printf 'train_control.sh: %s\n' "$msg" >&2
   exit 64
 }
 

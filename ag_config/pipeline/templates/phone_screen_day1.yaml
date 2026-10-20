@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TEMPLATE -- Day 1, phone screen (usecase phone_screen, glass), every trained defect type
+#
+# One of the reference configs docs/pipeline/config-from-request.md is written against (phone_screen). Three kinds
+# of line: unmarked ones are facts about the phone_screen model and are copied as they are; DEPLOYMENT lines
+# are the workflow's own values (mount paths, buckets), set once per deployment and shared by every
+# request; CHANGES PER REQUEST lines are the request's. A generated config must match this file
+# everywhere except the marked lines. Validate with:
+#
+#   python -m anomalygen.scripts.run_pipeline --config <file> --dry_run
+#
+# The clean images are the dataset's own, so there is no override. The dataset's images come from a
+# Roboflow export that cannot be downloaded by a script: a person exports it once, following the steps
+# under "Phone screen" in docs/tutorial/texture/2-dataset-preparation.md, puts the zip in a bucket the
+# pod can read, and names it in the usecase:// source below. Without that URL there is no config to write. A request naming specific types keeps only those keys.
+
+# ── where things live inside the pod (fixed; prepare fills input) ────────────
+input:  /work/dataset                       # DEPLOYMENT: the writable volume; prepare builds the phone_screen dataset here
+output: /work/out                           # DEPLOYMENT: same volume
+recipe: ag_config/exp_texture_ft_phone_screen.yaml    # ships with the code; the phone_screen model trained under it
+checkpoint: /mnt/ckpt/phone_screen/iter_000012000.pt # DEPLOYMENT: where the phone_screen fine-tuned weights are mounted (an hf:// source once published)
+
+# ── what to generate ──────────────────────────────────────────────────────────
+num_sdg: 15                   # CHANGES PER REQUEST: the sum of per_defect_counts
+per_defect_counts:            # CHANGES PER REQUEST: keep only the types the request names; 5 each
+  Phone+oil: 5
+  Phone+scratch: 5
+  Phone+stain: 5
+mode: inference
+amp_per_clean_pairing: off      # amp only; must stay off under amg
+output_naming: indexed          # amg draws clean images round-robin and may reuse one
+
+# ── seeds / execution (fixed) ─────────────────────────────────────────────────
+base_seed: 1
+num_gpus: 1
+guardrail: true
+
+# ── mask backend: amg, Astra through a registry file (fixed for phone_screen) ─────────
+amg_serve: null
+amg_gen_model: azure/openai/gpt-6-astra
+amg_judge_model: azure/openai/gpt-6-astra
+amg_model_registry: /mnt/secrets/endpoints.yaml   # DEPLOYMENT: where the model registry is mounted; it holds the key, never in this file
+amg_cache_dir: /work/amg_cache/phone_screen                # DEPLOYMENT: a writable path; keep one per use case so runs reuse the distilled library
+
+# ── sources and sink ──────────────────────────────────────────────────────────
+staging:
+  fetch:
+    input:
+      - usecase://phone_screen?zip=s3://sdg/datasets/mobile-screen-coco.zip   # DEPLOYMENT: the Roboflow COCO export, downloaded once by a person and kept in a bucket the pod reads
+  publish:
+    output: s3://sdg/generated/defect_image_generation/day1/phone_screen/   # DEPLOYMENT: the bucket and prefix root; nothing per request: the tail is day1/<usecase>/ and ends there
+
+# ── stages (fixed) ────────────────────────────────────────────────────────────
+stages: [prepare, amg, generate, export, publish]

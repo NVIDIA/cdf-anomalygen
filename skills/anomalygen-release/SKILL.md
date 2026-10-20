@@ -1,7 +1,7 @@
 ---
 name: anomalygen-release
 description: >-
-  Use when building the paidf-anomalygen Docker image (develop / product /
+  Use when building the cdf-anomalygen Docker image (develop / product /
   air-gapped) from docker/Dockerfile — build the chosen target from source and
   run it. Not for training or synthetic defect-image generation (SDG).
 license: Apache-2.0
@@ -11,7 +11,7 @@ compatibility: >-
 metadata:
   owner: NVIDIA
   service: docker
-  version: 1.1.0
+  version: 1.2.0
   reviewed: '2026-08-06'
   author: NVIDIA <nvidia@nvidia.com>
   tags:
@@ -27,15 +27,15 @@ metadata:
 
 ## Purpose
 
-Build and run the **paidf-anomalygen** container. `docker/Dockerfile` reproduces
+Build and run the **cdf-anomalygen** container. `docker/Dockerfile` reproduces
 `scripts/env_setup.sh` as a two-stage image (compile heavy wheels → slim non-root runtime).
 This is a **release/build** workflow — not training or inference
 (use the `anomalygen` skill for those). Build targets, GPU-arch lists, and troubleshooting
 detail live in `docker/README.md`. Run every command from the repo root.
 
 > **Check whether a build is needed at all.** Prebuilt images are published on
-> [NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/paidf-anomalygen):
-> `docker pull nvcr.io/nvidia/paidf-anomalygen:<tag>` needs no login and no compile.
+> [NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cdf-anomalygen):
+> `docker pull nvcr.io/nvidia/cdf-anomalygen:1.2.0` needs no login and no compile.
 > Build only when the user wants a modified image, a target NGC does not publish, or an
 > air-gapped bundle. **A build from source takes >1 h** — say so before starting one.
 
@@ -53,7 +53,7 @@ Do not use it to run training or SDG generation — that's the `anomalygen` skil
 - **Docker 23+** (BuildKit on by default) + **nvidia-container-toolkit** + a CUDA GPU.
 - Enough headroom for the source compile: the heavy extensions are memory-hungry and the
   build needs tens of GB of disk for intermediate layers.
-- The repo **`.venv`** (`scripts/env_setup.sh`: py3.13, torch 2.12.1+cu132) is **optional** —
+- The repo **`.venv`** (`scripts/env_setup.sh`: py3.13, torch 2.13.0+cu132) is **optional** —
   it is used only to auto-derive `TORCH_CUDA_ARCH_LIST` below, via
   `torch.cuda.get_arch_list()`. Without it the documented default is used.
 - **Air-gapped only:** the model checkpoints under `./checkpoints/`. `scripts/download_checkpoints.sh`
@@ -79,7 +79,7 @@ Set the shared variables once (arm64 host → use the commented values):
 
 ```shell
 export TARGET=develop                       # develop | product | airgapped-develop | airgapped-product
-export IMAGE=paidf-anomalygen:cuda-13.2.1-${TARGET}-ubuntu24.04-amd64
+export IMAGE=cdf-anomalygen:cuda-13.2.1-${TARGET}-ubuntu24.04-amd64
 # tag = <base-cuda>-<target>-<ubuntu>-<arch>; arm64 host → …-arm64. Set TARGET *first*: it feeds both
 # the tag and --target below, so they cannot disagree. Hardcoding "develop" here and then building
 # --target product silently ships a product image labelled develop.
@@ -155,7 +155,7 @@ Step 3 `docker run` invocation, so they are not a standalone entry point.
    air-gapped), a 20-iteration dry run finishes without error.
 
    > **The output root must be fresh, or this check is worthless.** A reused root resumes a leftover
-   > checkpoint and finishes instantly, which looks identical to success. The `$(date +%s)` suffix
+   > checkpoint and finishes instantly, which looks identical to success. The `date +%s` suffix
    > below is what makes it fresh — keep it, and confirm the run actually logs 20 iterations.
 
 ```shell
@@ -172,7 +172,7 @@ stop there (no push unless asked):
 
 ```shell
 export TARGET=product   # re-export IMAGE so the tag follows the target
-export IMAGE=paidf-anomalygen:cuda-13.2.1-${TARGET}-ubuntu24.04-amd64
+export IMAGE=cdf-anomalygen:cuda-13.2.1-${TARGET}-ubuntu24.04-amd64
 docker build --platform "$PLATFORM" -f docker/Dockerfile \
     --build-arg TORCH_CUDA_ARCH_LIST \
     --target "$TARGET" -t "$IMAGE" .

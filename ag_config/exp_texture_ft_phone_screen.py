@@ -10,7 +10,8 @@ dataset block is optional and shown at its default — edit or delete as needed.
 
 This is an EXAMPLE wired for the phone_screen dataset (Phone oil/scratch/stain). Copy it and edit
 ``ANOMALY_TYPES``, ``DATASET_PATH``, ``TESTCASE_JSONL`` (and ``DATASET_NAME``) for your own data;
-each ``[texture, defect]`` pair needs a matching ``{DATASET_PATH}/{texture}/{defect}/`` directory.
+each ``[texture, defect]`` pair needs matching ``{DATASET_PATH}/{texture}/anomaly_image/{defect}/`` and
+``{DATASET_PATH}/{texture}/mask/{defect}/`` directories.
 """
 
 from __future__ import annotations
@@ -51,14 +52,7 @@ anomalygen_texture_ft = build_anomalygen_texture_ft_experiment(
     betas=(0.9, 0.95),
     eps=1.0e-06,
     weight_decay=0.0,
-    # data
-    image_size=(512, 512),
-    batch_size=4,  # samples packed per training step
-    num_workers=4,
-    ratio_range=(1.5, 8.0),  # anomaly crop area ratio range
     # validation generation
-    model_input_size=512,
-    shift=5.0,
     validation_batch_size=16,
     # early stopping (disabled by default)
     early_stop_enabled=False,

@@ -11,7 +11,9 @@ edit the **required dataset block**; every other key ships at a tested default (
 to the default in the task's builder under `anomalygen/configs/`).
 
 ```shell
-cp ag_config/exp_texture_ft_phone_screen.yaml "${RECIPE}"
+TEMPLATE=ag_config/exp_texture_ft_phone_screen.yaml   # the worked example doubles as the template
+[ -f "${USER_RECIPE:-}" ] && TEMPLATE="${USER_RECIPE}"   # a recipe the user passed replaces it
+[ "${RECIPE}" = "${TEMPLATE}" ] || cp "${TEMPLATE}" "${RECIPE}"   # same file (name=phone_screen or a passed recipe): edit it in place
 ```
 
 > **Replace every key in the dataset block — all four.** They carry real phone_screen values, not `<name>`
@@ -19,27 +21,31 @@ cp ag_config/exp_texture_ft_phone_screen.yaml "${RECIPE}"
 
 Required — training fails or silently misaligns without these:
 
-| Key              | Example                                           | Note                                                              |
-| ---------------- | ------------------------------------------------- | ----------------------------------------------------------------- |
-| `dataset_name`   | `phone_screen`                                    | run-dir name segment                                              |
-| `dataset_path`   | `datasets/phone_screen`                           | Step 1 contract-layout root                                       |
-| `anomaly_types`  | `[[Phone, oil], [Phone, scratch]]`                | **every** `[texture, defect]` pair on disk; order fixes class ids |
-| `testcase_jsonl` | `datasets/validation_phone_screen/testcase.jsonl` | Step 2 **validation** AMP set — what each validation pass scores  |
+| Key              | Example                                           | Note                                                                                         |
+| ---------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `dataset_name`   | `phone_screen`                                    | run-dir name segment                                                                         |
+| `dataset_path`   | `datasets/phone_screen`                           | Step 1 contract-layout root                                                                  |
+| `anomaly_types`  | `[[Phone, oil], [Phone, scratch]]`                | **every** `[texture, defect]` pair on disk; sorted at parse, the sorted list fixes class ids |
+| `testcase_jsonl` | `datasets/validation_phone_screen/testcase.jsonl` | Step 2 **validation** set (AMG or AMP) — what each validation pass scores                    |
 
 Key optional knobs. Every value here **is** the builder default in
 `anomalygen/configs/texture/exp_config.py` — the example recipe is the reference that file is kept in
 sync with — so deleting a key preserves behaviour rather than changing it:
 
-| Key                                            | Value                     | Note                                             |
-| ---------------------------------------------- | ------------------------- | ------------------------------------------------ |
-| `model_size`                                   | `nano`                    | frozen backbone + base checkpoint — see below    |
-| `per_class_lora_rank` / `per_class_lora_alpha` | `8` / `8`                 | per-defect LoRA capacity on the frozen base      |
-| `max_iter` / `cycle_lengths`                   | `15000`                   | total training iterations                        |
-| `save_iter`                                    | `1000`                    | checkpoint every N iterations → `iter_<N>.pt`    |
-| `validation_iter`                              | `1000`                    | validate (write `valid/<N>/`) every N iterations |
-| `run_validation_on_start`                      | `true`                    | one validation at iteration 0 (baseline)         |
-| `lr` / `batch_size`                            | `0.001` / `4`             | AdamW learning rate / batch size                 |
-| `image_size` / `ratio_range`                   | `[512,512]` / `[1.5,8.0]` | input size; anomaly-crop area-ratio range        |
+| Key                                            | Value                 | Note                                                                   |
+| ---------------------------------------------- | --------------------- | ---------------------------------------------------------------------- |
+| `model_size`                                   | `nano`                | frozen backbone + base checkpoint — see below                          |
+| `per_class_lora_rank` / `per_class_lora_alpha` | `8` / `8`             | per-defect LoRA capacity on the frozen base                            |
+| `max_iter` / `cycle_lengths`                   | `15000`               | total training iterations / learning-rate schedule length; keep equal  |
+| `save_iter`                                    | `1000`                | checkpoint every N iterations → `iter_<N>.pt`                          |
+| `validation_iter`                              | `1000`                | validate (write `valid/<N>/`) every N iterations                       |
+| `run_validation_on_start`                      | `true`                | one validation at iteration 0 (baseline)                               |
+| `lr` / `max_sequence_length`                   | `0.001` / `5120`      | AdamW learning rate / token budget per step                            |
+| `activation_checkpointing_mode`                | `none`                | `none` / `selective` / `full`; trades recompute for memory only        |
+| `input_size_ladder`                            | `[256,512,1024,1536]` | allowed input sizes; one entry pins a fixed size                       |
+| `crop_mode`                                    | `scale`               | framing source: `scale` (context + resample) or `ratio` (bbox × ratio) |
+| `crop_ratio_range`                             | `[1.5,2.5]`           | context ratio around the defect; `1.5 <= low < high`, never pinned     |
+| `scale_range`                                  | `[0.333,3.0]`         | resample-scale draw; teaches defect-size invariance                    |
 
 > **`model_size` has to be right before training starts.** It picks the frozen backbone (`nano` =
 > Qwen3-VL-8B, `edge` = Nemotron-3 Dense VL 2B — experimental) *and* the base checkpoint generation
@@ -48,17 +54,21 @@ sync with — so deleting a key preserves behaviour rather than changing it:
 > falls back to `nano`, so a recipe that never mentions it is a `nano` run — say so rather than
 > leaving it implicit.
 >
-> **Do not set the augmentation probabilities.** `background_dropout_prob`, `inst_aug_prob` and
-> `ring_jitter_prob` each default to `0.5` and are the regime the model was validated under, not
-> per-dataset dials. They are deliberately absent from the example recipe: omit them and you get the
-> validated behaviour. Set them only for a deliberate ablation the user asked for.
+> **Do not set the augmentation probabilities.** `inst_aug_prob` defaults to `0.2`, so instance drop
+> is on; `background_dropout_prob` and `ring_jitter_prob` default to `0.0`, i.e. off. These are the
+> regime the model was validated under, not per-dataset dials. They are deliberately absent from the
+> example recipe: omit them and you get the validated behaviour. Set them only for a deliberate
+> ablation the user asked for. The one exception is the `legacy_fixed_size` block in `SKILL.md`
+> Step 3, which sets all three as part of the legacy mechanism — append it whole.
 
-`anomaly_types` order is load-bearing: it maps each pair to a class id used by generation and
-evaluation. Use the **run-dir copy** of the recipe downstream so the order never drifts.
+`anomaly_types` is sorted and deduplicated at recipe parse, so class ids never depend on the order a
+recipe lists them; the checkpoint stamps the sorted list and refuses a recipe whose *set* differs.
+Use the **run-dir copy** of the recipe downstream so the set never drifts.
 
 ## Launch — detached, then wait for it to exit
 
-A `max_iter=5000` fine-tune runs ~1 h; the default `15000` runs ~4 h — too long for one foreground
+A fine-tune at the default `max_iter=15000` runs for hours (dataset-dependent; the measured times are
+in the tutorial's timing table, `docs/tutorial/texture/7-agentic-end-to-end-flow.md`) — too long for one foreground
 call, so `scripts/skill_utility/train_control.sh` launches it detached and polls it in slices.
 `SKILL.md` Step 3 holds the invocation; this section covers what the script is doing and why.
 
@@ -84,11 +94,11 @@ experiment=anomalygen_${TASK}`, with `IMAGINAIRE_OUTPUT_ROOT` pointing at `./res
   second would orphan the first. Use a different `--name`, or `stop` first.
 - **Quick dry run:** append `-- trainer.max_iter=20 trainer.validation_iter=10 checkpoint.save_iter=10`
   to `start` to smoke-test the full loop in a couple of minutes. Anything after `--` is passed through
-  as a hydra override.
+  as a hydra override. A dry run can leave `cycle_lengths` as it is.
 
 `wait` blocks for `--timeout` seconds (default 570) and reports the run as its **exit code**: `0`
 finished, `1` failed, `2` still running. Repeat it while it returns 2 — one call is ~9.5 min, so
-`max_iter=5000` ≈ ~6 calls and the `15000` default ≈ ~25. Exit 0 requires the `Done with training`
+the `15000` default takes dozens of them. Exit 0 requires the `Done with training`
 marker *and* waits for the process to actually exit, so the GPUs are released before Step 4 generates
 on them. A dead process without the marker is exit 1, never a quiet success.
 
@@ -103,7 +113,8 @@ If the run *is* killed, `start` again — the trainer resumes from `checkpoints/
 > `job_name`, so renaming it in the recipe — the documented way to get a clean run dir instead of
 > resuming an old checkpoint — also needs `--job_name <new>` passed to `set_pipeline_vars.sh`. Change
 > only the recipe and Steps 4-7 read the *old* run dir: a stale checkpoint and a stale recipe copy,
-> both of which load without complaint.
+> both of which load without complaint. `legacy_fixed_size` renames it to `anomalygen_texture_ft_legacy`
+> on both sides.
 
 Run dir `${RUN_DIR}` (`results/anomalygen/${NAME}/${JOB_NAME}`), containing
 `checkpoints/model/iter_<N>.pt`, `checkpoints/best_checkpoint.txt` (peak-scoring iteration, written at
@@ -223,11 +234,12 @@ the curve. Watch these to judge quality vs. iteration and to choose the best che
 
 ## Error handling
 
-| Symptom                                             | Action                                                                                                                                   |
-| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| Validation scores nothing / `testcase_jsonl` errors | Step 2 (validation AMP) not run or not wired into the recipe — build it first                                                            |
-| `anomaly_types` mismatch downstream                 | Use the **run-dir recipe copy** for Steps 4–7; a different order remaps class ids                                                        |
-| Trainer resumes from an old checkpoint              | It resumes from any checkpoint in the run dir — use a new `job_name` (or `IMAGINAIRE_OUTPUT_ROOT`) for a clean start; see the note below |
-| OOM during training                                 | Lower `batch_size` or `image_size`; reduce `validation_batch_size`                                                                       |
-| Loss diverges / NaN                                 | Lower `lr` (e.g. `0.0005`); check the dataset masks                                                                                      |
-| Multi-GPU hang / NCCL error                         | Verify `CUDA_VISIBLE_DEVICES` and driver; retry with `--nproc_per_node=1` to isolate                                                     |
+| Symptom                                             | Action                                                                                                                                                                                                            |
+| --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Validation scores nothing / `testcase_jsonl` errors | Step 2 (validation set) not run or not wired into the recipe — build it first                                                                                                                                     |
+| `anomaly_types` mismatch downstream                 | Use the **run-dir recipe copy** for Steps 4–7; a different set is refused by the checkpoint stamp                                                                                                                 |
+| Trainer resumes from an old checkpoint              | It resumes from any checkpoint in the run dir — use a new `job_name` (or `IMAGINAIRE_OUTPUT_ROOT`) for a clean start; see the note below                                                                          |
+| OOM during training                                 | Set `activation_checkpointing_mode: selective` (or `full`) first — memory only, training unchanged; then lower `max_sequence_length` or drop the largest `input_size_ladder` size; reduce `validation_batch_size` |
+| Loss diverges / NaN                                 | Lower `lr` (e.g. `0.0005`); check the dataset masks                                                                                                                                                               |
+| Multi-GPU hang / NCCL error                         | Verify `CUDA_VISIBLE_DEVICES` and driver; retry with `--nproc_per_node=1` to isolate                                                                                                                              |
+| Dies at step `cycle_lengths + 1` with `TypeError`   | `list indices must be integers or slices, not NoneType` means `max_iter` is larger than `cycle_lengths`; set them equal and relaunch                                                                              |

@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# ``anomalygen_texture_ft_legacy`` — I2I anomaly-inpainting training recipe (magnetic_tile dataset), legacy mechanism.
+#
+# Copied from ``exp_texture_ft_magnetic_tile.yaml``: ONLY ``job_name`` and the "legacy mechanism" block
+# below differ. That block spells the legacy framing and augmentations in current keys, following the
+# "Fixed-input-size training" section of docs/tutorial/texture/4-fine-tuning.md: every sample is
+# cropped around its defect onto one fixed 512 px input, with the legacy augmentation rates. A legacy
+# recipe's own keys (``image_size``, ``model_input_size``, ``ratio_range``) are also accepted and
+# rewritten to these by the loader.
+
+task_type: texture_ft
+experiment: anomalygen_texture_ft
+job_name: anomalygen_texture_ft_legacy
+
+# --- dataset (required) -----------------------------------------------------------------------
+dataset_name: magnetic_tile
+anomaly_types: [[metal_surface, MT_Blowhole], [metal_surface, MT_Break], [metal_surface, MT_Crack], [metal_surface, MT_Fray], [metal_surface, MT_Uneven]]
+dataset_path: datasets/magnetic_tile
+testcase_jsonl: datasets/validation_magnetic_tile/testcase.jsonl
+
+# --- model size (Cosmos3 backbone selection) --------------------------------------------------
+model_size: nano   # nano (Qwen3-VL-8B, recommended default) | edge (Nemotron-3 Dense VL 2B, experimental)
+
+# --- per-defect-type LoRA (adjust the rank and alpha for LoRA capacity; default to 8) ---------
+per_class_lora_rank: 8
+per_class_lora_alpha: 8
+
+# --- legacy mechanism: fixed 512 px input, bbox-relative framing, legacy augmentation rates ----
+input_size_ladder: [512]
+crop_mode: ratio
+crop_ratio_range: [1.5, 8.0]
+background_dropout_prob: 0.5
+ring_jitter_prob: 0.5
+inst_aug_prob: 0.5
+
+# --- schedule / trainer -----------------------------------------------------------------------
+max_iter: 15000
+validation_iter: 1000
+run_validation_on_start: true   # run one validation pass at iter 0, before training
+save_iter: 1000
+cycle_lengths: 15000
+warm_up_steps: 500
+logging_iter: 10
+seed: 42
+
+# --- optimizer (AdamW) ------------------------------------------------------------------------
+lr: 0.001
+betas: [0.9, 0.95]
+eps: 1.0e-06
+weight_decay: 0.0
+
+# --- validation generation --------------------------------------------------------------------
+validation_batch_size: 16
+
+# --- early stopping ---------------------------------------------------------------------------
+early_stop_enabled: false
+early_stop_metric: nn          # nn | mnn | fid | aq_nn | completeness | precision | boundary_iou
+                               # fid is lower-better; every other metric is higher-better
+early_stop_patience: 5
+early_stop_min_delta: 0.0
+early_stop_min_delta_mode: rel  # rel | abs

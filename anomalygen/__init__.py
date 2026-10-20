@@ -7,6 +7,8 @@ Importing the package registers the reusable library groups (model group, ckpt_t
 callbacks) — when the training stack is available.
 """
 
+from anomalygen import transformers_patch  # noqa: F401  (must precede the framework imports below)
+
 try:
     from anomalygen import register  # noqa: F401  (registration side effects)
 except ImportError:

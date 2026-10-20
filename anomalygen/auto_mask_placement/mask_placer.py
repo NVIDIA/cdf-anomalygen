@@ -79,7 +79,7 @@ class MaskPlacer:
     ) -> Tuple[int, int]:
         """Calculate placement position based on ROI alignment point and fixed point"""
         # Get ROI bounding box
-        y_coords, x_coords = np.where(roi_mask > 127)
+        y_coords, x_coords = np.nonzero(roi_mask > 127)
         if len(x_coords) == 0 or len(y_coords) == 0:
             # Fallback to center if no valid coordinates
             return self.image_width // 2 - mask_w // 2, self.image_height // 2 - mask_h // 2
@@ -178,7 +178,7 @@ class MaskPlacer:
         """Log information about the augmented mask"""
         mask_h_full, mask_w_full = augmented_mask.shape
 
-        y_coords_mask, x_coords_mask = np.where(augmented_mask > 127)
+        y_coords_mask, x_coords_mask = np.nonzero(augmented_mask > 127)
         if len(x_coords_mask) > 0 and len(y_coords_mask) > 0:
             mask_min_x = np.min(x_coords_mask)
             mask_max_x = np.max(x_coords_mask)

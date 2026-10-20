@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TEMPLATE -- Day 0, a chip passive component, its simulated crops, missing-component defects
+#
+# One of the reference configs docs/pipeline/config-from-request.md is written against (pcb). Three kinds of
+# line: unmarked ones are facts about the pcb model and are copied as they are; DEPLOYMENT lines
+# are the workflow's own values (mount paths, buckets), set once per deployment and shared by every
+# request; CHANGES PER REQUEST lines are the request's. A generated config must match this file
+# everywhere except the marked lines. Validate with:
+#
+#   python -m anomalygen.scripts.run_pipeline --config <file> --dry_run
+#
+# Template. Day 0: the clean images are the simulated crops the upstream tasks produced (usd2roi
+# render, then sim2real augmentation), flattened by the workflow into ONE directory of uniquely
+# named files. The config does not know or care how many; amg draws them round-robin.
+
+# ── where things live inside the pod (fixed; prepare fills input) ────────────
+input:  /work/dataset                       # DEPLOYMENT: the writable volume; prepare builds the pcb dataset here
+output: /work/out                           # DEPLOYMENT: same volume
+recipe: ag_config/exp_texture_ft_pcb.yaml   # ships with the code; the pcb model trained under it
+checkpoint: /mnt/ckpt/pcb/iter_000015000.pt # DEPLOYMENT: where the pcb fine-tuned weights are mounted (an hf:// source once published)
+
+# ── what to generate ──────────────────────────────────────────────────────────
+num_sdg: 5
+per_defect_counts: {passive_component+missing: 5}   # CHANGES PER REQUEST: one <texture>+<defect>, count = num_sdg
+mode: inference
+amp_per_clean_pairing: off      # amp only; must stay off under amg
+output_naming: indexed          # amg draws clean images round-robin and may reuse one
+
+# ── seeds / execution (fixed) ─────────────────────────────────────────────────
+base_seed: 1
+num_gpus: 1
+guardrail: true
+
+# ── mask backend: amg, Gemma started by this run (fixed for Day 0) ────────────
+# The pod needs max(2, num_gpus) GPUs and the Gemma weights on the checkpoints volume; nothing is
+# serving beforehand and no registry or key is involved.
+amg_serve: gemma-4-31b-it
+amg_gen_model: null             # -> the recipe's served model
+amg_judge_model: null           # -> the recipe's served model
+amg_model_registry: null
+amg_cache_dir: /work/amg_cache/pcb                # DEPLOYMENT: a writable path; keep one per use case so runs reuse the distilled library
+amg_beam_multi: 4               # the local-Gemma recipe: in-loop beam + the three information channels
+amg_beam_pairwise: true
+amg_exemplar_captions: true
+amg_exemplar_visual_prompt: true
+amg_coverage_note: true
+
+# ── sources and sink ──────────────────────────────────────────────────────────
+staging:
+  fetch:
+    input:
+      - usecase://pcb                 # pcb's shipped prepare script: pulls nvidia/Cosmos-AnomalyGen-PCB-Dataset into the Step 1 layout
+    input_override:                   # paths INSIDE input that are REPLACED by the sources listed for them
+      passive_component/clean_image: # CHANGES PER REQUEST: Decision 1 -- the whole clean_image/ of that texture
+        - s3://sdg/generated/defect_image_generation/runs/<run>/augment/<component>/passive_component/   # DEPLOYMENT: the prefix the upstream augment task writes; CHANGES PER REQUEST: its run/component part
+  publish:
+    output: s3://sdg/generated/defect_image_generation/day0/pcb/<component>/missing/   # DEPLOYMENT: the bucket and prefix root; CHANGES PER REQUEST: the <component>/<defect>/ tail after day0/pcb/
+
+# ── stages (fixed) ────────────────────────────────────────────────────────────
+stages: [prepare, amg, generate, export, publish]

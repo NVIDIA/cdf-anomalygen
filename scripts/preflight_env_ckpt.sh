@@ -28,14 +28,42 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CKPT_DIR="${CKPT_DIR:-${REPO_ROOT}/checkpoints}"
-BASE_CHECKPOINT_NAMES=(Cosmos3-Nano Cosmos3-Edge)
+
+# Every location and probe below comes from the catalogue, which is also what download_checkpoints.sh
+# provisions from -- so this cannot assert a path the provisioner does not write. Asked separately
+# they drifted: this file wanted face_blur_filter/Resnet50_Final.pth from the guardrail snapshot and
+# the provisioner's skip guard tested only `blocklist`.
+# shellcheck source=scripts/weights_catalogue.sh
+source "${REPO_ROOT}/scripts/weights_catalogue.sh"
+# Resolved up front and each one CHECKED with `|| exit`, because this file deliberately runs without
+# `set -e`: it collects every failure and reports them together, so aborting on the first would
+# defeat it. That makes a bare `X="$(w_location ...)"` silent here in a way it is not in
+# download_checkpoints.sh -- the lookup fails, prints, and leaves X empty, and
+# `check_weights_dir "${CKPT_DIR}/"` then finds the first >=100MB file anywhere under checkpoints/
+# and prints [pass] for a weight that is missing. A false green is the one answer a preflight must
+# never give, so these exit rather than collect.
+#
+# `|| exit` on the ASSIGNMENT, which carries the substitution's status. Wrapping the lookup in a
+# helper that exits does not work: the exit runs in the command substitution's subshell and the
+# script carries on with an empty value -- the same silent failure in a different disguise.
+BASE_NANO_NAME="$(w_location base-nano)" || exit 2
+BASE_EDGE_NAME="$(w_location base-edge)" || exit 2
+BASE_CHECKPOINT_NAMES=("${BASE_NANO_NAME}" "${BASE_EDGE_NAME}")
+DINOV2_LOCATION="$(w_location dinov2)" || exit 2
+CRADIO_LOCATION="$(w_location cradio)" || exit 2
+WAN_VAE_LOCATION="$(w_location wan-vae)" || exit 2
+SAM2_LOCATION="$(w_location sam2)" || exit 2
+COSMOS_VLM_LOCATION="$(w_location cosmos-vlm)" || exit 2
+QWEN_TOKENIZER_REPO="$(w_repo qwen-tokenizer)" || exit 2
+EDGE_PROCESSOR_REPO="$(w_repo edge-processor)" || exit 2
+GEMMA_REPO_ID="$(w_repo gemma)" || exit 2
 PY="${PYTHON:-python}"
 
 fail=0
 ckpt_missing=0
-ok()  { printf '[pass] %s\n' "$1"; }
-bad() { printf '[fail] %s\n' "$1"; fail=$((fail + 1)); }
-hdr() { printf '\n=== %s ===\n' "$1"; }
+ok()  { local msg="$1"; printf '[pass] %s\n' "$msg"; return 0; }
+bad() { local msg="$1"; printf '[fail] %s\n' "$msg"; fail=$((fail + 1)); return 0; }
+hdr() { local title="$1"; printf '\n=== %s ===\n' "$title"; return 0; }
 
 # --- 1. GPU / NVIDIA driver (nvidia-smi) --------------------------------------
 hdr "GPU / NVIDIA driver"
@@ -155,76 +183,94 @@ hdr "Model checkpoints (under ${CKPT_DIR})"
 # small metadata (config.json) and dies before the weights, and a presence-only gate green-lights that
 # — then the model load fails much later instead of here. `min_mb` is a floor well under the real size,
 # enough to catch a truncated or zero-byte file without pinning an exact version.
-check_dir() {  # non-empty directory
-  if [[ -d "$1" ]] && [[ -n "$(ls -A "$1" 2>/dev/null)" ]]; then ok "$2"; else bad "$2 — missing: $1"; ckpt_missing=$((ckpt_missing + 1)); fi
+check_dir() {  # check_dir <dir> <label>: non-empty directory
+  local dir="$1" label="$2"
+  if [[ -d "$dir" ]] && [[ -n "$(ls -A "$dir" 2>/dev/null)" ]]; then
+    ok "$label"
+  else
+    bad "$label — missing: $dir"; ckpt_missing=$((ckpt_missing + 1))
+  fi
+  return 0
 }
 check_file() {  # check_file <path> <label> [min_mb]
-  local min_mb="${3:-0}" size_mb
-  if [[ ! -f "$1" ]]; then bad "$2 — missing: $1"; ckpt_missing=$((ckpt_missing + 1)); return; fi
-  size_mb=$(( $(wc -c < "$1" 2>/dev/null || echo 0) / 1048576 ))
+  local path="$1" label="$2" min_mb="${3:-0}" size_mb
+  if [[ ! -f "$path" ]]; then bad "$label — missing: $path"; ckpt_missing=$((ckpt_missing + 1)); return; fi
+  size_mb=$(( $(wc -c < "$path" 2>/dev/null || echo 0) / 1048576 ))
   if [[ "$size_mb" -lt "$min_mb" ]]; then
-    bad "$2 — truncated: $1 is ${size_mb}MB, expected >= ${min_mb}MB (re-download)"
+    bad "$label — truncated: $path is ${size_mb}MB, expected >= ${min_mb}MB (re-download)"
     ckpt_missing=$((ckpt_missing + 1))
   else
-    ok "$2"
+    ok "$label"
   fi
 }
 # A weights dir is only as good as its largest file — catches a config-only partial pull.
 check_weights_dir() {  # check_weights_dir <dir> <label> <min_mb>
-  local biggest
-  if [[ ! -d "$1" ]]; then bad "$2 — missing: $1"; ckpt_missing=$((ckpt_missing + 1)); return; fi
-  biggest=$(find "$1" -type f -printf '%s\n' 2>/dev/null | sort -rn | head -1)
+  local dir="$1" label="$2" min_mb="$3" biggest
+  if [[ ! -d "$dir" ]]; then bad "$label — missing: $dir"; ckpt_missing=$((ckpt_missing + 1)); return; fi
+  biggest=$(find "$dir" -type f -printf '%s\n' 2>/dev/null | sort -rn | head -1)
   biggest=$(( ${biggest:-0} / 1048576 ))
-  if [[ "$biggest" -lt "$3" ]]; then
-    bad "$2 — no weight file >= $3MB under $1 (largest ${biggest}MB; partial download?)"
+  if [[ "$biggest" -lt "$min_mb" ]]; then
+    bad "$label — no weight file >= ${min_mb}MB under $dir (largest ${biggest}MB; partial download?)"
     ckpt_missing=$((ckpt_missing + 1))
   else
-    ok "$2"
+    ok "$label"
   fi
 }
 
 # HF hub-cache entries are resolved by repo id, not path, so a snapshot alone is not enough:
 # refs/<rev> must map branch -> sha (a sha-pinned `hf download` never writes it), and <probe> must
 # exist in that snapshot. Pass an empty <ref> for entries the framework resolves by pinned sha.
-check_hf_cache() {  # check_hf_cache <repo id> <ref name, or "" to skip> <probe path in snapshot> <label>
-  local dir="${CKPT_DIR}/hf/models--${1//\//--}" sha
-  if [[ ! -d "$dir" ]]; then bad "$4 — missing: $dir"; ckpt_missing=$((ckpt_missing + 1)); return; fi
-  if [[ -n "$2" ]]; then
-    if [[ ! -s "${dir}/refs/$2" ]]; then
-      bad "$4 — no refs/$2 under $dir; an offline resolve of revision '$2' cannot find the snapshot"
+# The probes are the catalogue's, and all of them are required -- a hub-cache entry is complete or
+# it is not. w_probes fails for a repo the catalogue does not carry, which is what stops a repo id
+# typed here from quietly checking nothing.
+check_hf_cache() {  # check_hf_cache <repo id> <ref name, or "" to skip> <label>
+  local repo="$1" ref="$2" label="$3" sha probe probes
+  local dir="${CKPT_DIR}/hf/models--${repo//\//--}"
+  if ! probes="$(w_probes "$repo")"; then
+    bad "$label — not in scripts/weights_catalogue.sh, so there is nothing to check it against"
+    ckpt_missing=$((ckpt_missing + 1)); return
+  fi
+  if [[ ! -d "$dir" ]]; then bad "$label — missing: $dir"; ckpt_missing=$((ckpt_missing + 1)); return; fi
+  if [[ -n "$ref" ]]; then
+    if [[ ! -s "${dir}/refs/${ref}" ]]; then
+      bad "$label — no refs/${ref} under $dir; an offline resolve of revision '${ref}' cannot find the snapshot"
       ckpt_missing=$((ckpt_missing + 1)); return
     fi
-    sha="$(cat "${dir}/refs/$2")"
+    sha="$(cat "${dir}/refs/${ref}")"
   else
     sha="$(ls -1 "${dir}/snapshots" 2>/dev/null | head -1)"
   fi
-  if [[ -z "$sha" ]] || [[ ! -e "${dir}/snapshots/${sha}/$3" ]]; then
-    bad "$4 — $3 missing from snapshot ${sha:-<none>} under $dir (partial download?)"
-    ckpt_missing=$((ckpt_missing + 1)); return
-  fi
-  ok "$4"
+  for probe in ${probes}; do
+    if [[ -z "$sha" ]] || [[ ! -e "${dir}/snapshots/${sha}/${probe}" ]]; then
+      bad "$label — ${probe} missing from snapshot ${sha:-<none>} under $dir (partial download?)"
+      ckpt_missing=$((ckpt_missing + 1)); return
+    fi
+  done
+  ok "$label"
 }
 
 # Both sizes: model_size picks the DCP, so checking nano alone let an edge run die at model load.
 for base_name in "${BASE_CHECKPOINT_NAMES[@]}"; do
   check_weights_dir "${CKPT_DIR}/${base_name}" "${base_name} (Base model)" 100
 done
-check_weights_dir "${CKPT_DIR}/facebook/dinov2-large" "DINOv2 (KPI model)" 100
-check_file "${CKPT_DIR}/nvidia/C-RADIO-V3/model.safetensors" "C-RADIO v3 (KPI model)" 100
-check_file "${CKPT_DIR}/wan2pt2/Wan2.2_VAE.pth" "Wan2.2 VAE (tokenizer)" 100
-check_file "${CKPT_DIR}/facebook/sam2.1-hiera-large/sam2.1_hiera_large.pt" "SAM2.1 (ROI segmentation)" 100
-check_file "${CKPT_DIR}/nvidia/Cosmos3-Nano/config.json" "Cosmos3-Nano HF config" 0
-check_weights_dir "${CKPT_DIR}/nvidia/Cosmos3-Nano" "Cosmos3-Nano HF weights (Text2ROI, Caption)" 100
+# The minimum sizes are this file's own: the catalogue says where a weight is and what proves it is
+# there, and a floor well under the real size is a stricter test on top of that, not a second answer.
+check_weights_dir "${CKPT_DIR}/${DINOV2_LOCATION}" "DINOv2 (KPI model)" 100
+check_file "${CKPT_DIR}/${CRADIO_LOCATION}" "C-RADIO v3 (KPI model)" 100
+check_file "${CKPT_DIR}/${WAN_VAE_LOCATION}" "Wan2.2 VAE (tokenizer)" 100
+check_file "${CKPT_DIR}/${SAM2_LOCATION}" "SAM2.1 (ROI segmentation)" 100
+check_file "${CKPT_DIR}/${COSMOS_VLM_LOCATION}" "Cosmos3-Nano HF config" 0
+check_weights_dir "${CKPT_DIR}/${COSMOS_VLM_LOCATION%/*}" "Cosmos3-Nano HF weights (Text2ROI, Caption)" 100
 
 # --- HF hub cache (${CKPT_DIR}/hf) --------------------------------------------
 # Guardrail: resolved at the sha the framework itself pins (GUARDRAIL1_CHECKPOINT.revision), so no ref.
-check_hf_cache nvidia/Cosmos-Guardrail1 "" blocklist "Cosmos-Guardrail1 (generate.py guardrail)"
+check_hf_cache nvidia/Cosmos-Guardrail1 "" "Cosmos-Guardrail1 (generate.py guardrail)"
 # Qwen3Guard: the framework calls from_pretrained() unpinned, i.e. by branch, so refs/main is required.
-check_hf_cache Qwen/Qwen3Guard-Gen-0.6B main model.safetensors "Qwen3Guard-Gen-0.6B (text safety)"
+check_hf_cache Qwen/Qwen3Guard-Gen-0.6B main "Qwen3Guard-Gen-0.6B (text safety)"
 # Caption tokenizer for model_size: nano. Weights are deliberately absent — probe a tokenizer file.
-check_hf_cache Qwen/Qwen3-VL-8B-Instruct main tokenizer.json "Qwen3-VL tokenizer (nano caption)"
+check_hf_cache "${QWEN_TOKENIZER_REPO}" main "Qwen3-VL tokenizer (nano caption)"
 # Caption processor for model_size: edge, resolved from this cache while the model is being built.
-check_hf_cache nvidia/Cosmos3-Edge main processor_config.json "Cosmos3-Edge processor (edge caption)"
+check_hf_cache "${EDGE_PROCESSOR_REPO}" main "Cosmos3-Edge processor (edge caption)"
 # That entry is partial (no generation weights), which only resolves offline while no tree manifest
 # claims more files than are on disk. hf >= 1.26 writes one; the downloader removes it, a hand-run
 # `hf download` puts it back and silently re-breaks air-gapped edge.
@@ -233,6 +279,21 @@ if [[ -d "${CKPT_DIR}/hf/models--nvidia--Cosmos3-Edge/trees" ]]; then
   ckpt_missing=$((ckpt_missing + 1))
 else
   ok "Cosmos3-Edge processor — no tree manifest (partial snapshot resolves offline)"
+fi
+# Gemma: scripts/agentic_mask_generation_serving/gemma-4-31b-it.sh serves it via vllm by bare repo id (no revision), so
+# an offline resolve needs refs/main; probe BOTH weight shards, not config.json — hf links each file
+# into the snapshot as it completes, so the small metadata is "present" within seconds of a pull
+# starting and a config-only probe green-lights an interrupted download.
+GEMMA_REPO="${GEMMA_REPO_ID}"
+check_hf_cache "$GEMMA_REPO" main "Gemma-4-31b-it (AMG serving VLM, both shards)"
+# The air-gapped images bake this cache root-owned and hf 1.26 reads trees/<sha>.json on every
+# offline resolve, which a non-root uid cannot — every vllm start then warns "Ignoring corrupted
+# tree cache file". The downloader removes it; a hand-run `hf download` puts it back.
+if [[ -d "${CKPT_DIR}/hf/models--${GEMMA_REPO//\//--}/trees" ]]; then
+  bad "Gemma-4-31b-it — repo tree manifest present; a baked, non-root offline resolve warns on every serve. Re-run scripts/download_checkpoints.sh (or: rm -rf ${CKPT_DIR}/hf/models--${GEMMA_REPO//\//--}/trees)"
+  ckpt_missing=$((ckpt_missing + 1))
+else
+  ok "Gemma-4-31b-it — no tree manifest (offline resolve is silent)"
 fi
 
 # --- 7. checkpoint integrity --------------------------------------------------

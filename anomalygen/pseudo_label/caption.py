@@ -24,15 +24,22 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import transformers
 from cosmos_framework.utils import log
 from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, Cosmos3OmniForConditionalGeneration, LogitsProcessor, LogitsProcessorList
+
+from anomalygen.models import device as device_placement
 
 # The captioner runs the Cosmos3-Nano reasoner exclusively.
 MODEL_ID = "nvidia/Cosmos3-Nano"
 
 # Default captioning prompt shipped with the package (system + user prompt with {placeholders}).
 DEFAULT_CAPTION_PROMPT_PATH = Path(__file__).parent / "default_caption_prompt.yaml"
+
+# Room a single GPU must have beyond the weights: the KV cache of a 4096-token caption, the vision
+# tower's activations and allocator slack. A quarter of the weights covers all three with margin.
+_PLACEMENT_HEADROOM = 0.25
 
 
 class _UsableLogitsGuard(LogitsProcessor):
@@ -77,10 +84,10 @@ class _UsableLogitsGuard(LogitsProcessor):
                 f"{n_exhausted} of {exhausted.numel()} rows fully masked)"
                 + (f" while captioning {self.context}" if self.context else "")
                 + ". The caption is not recoverable from this state, so no output was written. "
-                "Re-run this sample in isolation to confirm it is reproducible; if it is, capture "
-                "the model's device placement (`model.hf_device_map`) and the installed "
-                "transformers/torch versions, which is what distinguishes an environment problem "
-                "from a bad input."
+                "Re-run this sample in isolation to confirm it is reproducible. If the load log shows "
+                "the model sharded across GPUs, re-run with a single GPU visible: a failure that "
+                "disappears then, or that repeats with identical counts for every GPU pair, is the "
+                "host corrupting device-to-device copies, not the model or the input."
             )
         return scores
 
@@ -93,6 +100,40 @@ def _resolve_model_path(model_id: str) -> str:
         if (local / "config.json").exists():
             return str(local)
     return model_id
+
+
+def _checkpoint_bytes(model_path: str) -> typing.Optional[int]:
+    """Size of the weights on disk, or ``None`` when it cannot be known before the load (a hub id)."""
+    root = Path(model_path)
+    if not root.is_dir():
+        return None
+    index = root / "model.safetensors.index.json"
+    if index.is_file():
+        try:
+            total = json.loads(index.read_text()).get("metadata", {}).get("total_size")
+        except (OSError, ValueError):
+            total = None
+        if total:
+            return int(total)
+    return sum(f.stat().st_size for f in root.rglob("*.safetensors")) or None
+
+
+def _device_map(weight_bytes: typing.Optional[int], free_bytes: typing.Sequence[int]) -> typing.Union[str, dict]:
+    """One GPU when any has room for the weights plus headroom, otherwise accelerate's ``auto`` split.
+
+    Sharding a model that fits is all cost: every shard boundary becomes a device-to-device copy of
+    the hidden state, and a host that corrupts or drops those copies feeds the next shard a wrong
+    hidden state that is still finite, so the damage surfaces only as a few ``nan``/``+inf`` logits.
+    Placement therefore takes the GPU with the most free memory (lowest index on a tie) and splits
+    only when no single one is big enough. ``auto`` is also the answer when the size is unknown or
+    there is no GPU at all, which is the CPU path.
+    """
+    if weight_bytes is None or not free_bytes:
+        return "auto"
+    best = device_placement.roomiest(free_bytes)
+    if free_bytes[best] < weight_bytes * (1 + _PLACEMENT_HEADROOM):
+        return "auto"
+    return {"": f"cuda:{best}"}
 
 
 class Captioner:
@@ -130,7 +171,10 @@ class Captioner:
     def load(self) -> None:
         """Load the Cosmos3-Nano processor and model (idempotent).
 
-        Placement is ``device_map="auto"``: the CUDA device(s) when present, otherwise CPU.
+        Placement is one GPU when one has room (see :func:`_device_map`), else ``device_map="auto"``:
+        a split across the CUDA devices when present, otherwise CPU. The decision, the resulting
+        device map and the library versions are logged, since they are what a numerically broken
+        decode has to be triaged against.
         """
         if self.model is not None:
             return
@@ -138,11 +182,27 @@ class Captioner:
         # Prefer a local checkpoints/<org>/<name> copy if present; else load from the HF hub.
         model_path = _resolve_model_path(MODEL_ID)
         self.processor = AutoProcessor.from_pretrained(model_path)
+        free_bytes = device_placement.free_bytes() if torch.cuda.is_available() else []
+        device_map = _device_map(_checkpoint_bytes(model_path), free_bytes)
         self.model = Cosmos3OmniForConditionalGeneration.from_pretrained(
             model_path,
             dtype="auto",
-            device_map="auto",
+            device_map=device_map,
         )
+        # A single-device load leaves ``hf_device_map`` unset; the model's device is the placement then.
+        placement = getattr(self.model, "hf_device_map", None) or str(self.model.device)
+        log.info(
+            f"Captioner loaded {model_path} with transformers {transformers.__version__} / torch "
+            f"{torch.__version__}; requested device_map={device_map}, "
+            f"placement={json.dumps(placement, sort_keys=True, default=str)}"
+        )
+        devices = set(placement.values()) if isinstance(placement, dict) else {placement}
+        if len(devices) > 1:
+            log.warning(
+                f"Captioner is sharded across {len(devices)} devices, so every decode step moves the "
+                "hidden state between GPUs. A host that corrupts those copies shows up as nan/+inf "
+                "logits; re-run with a single GPU visible to tell that apart from a model problem."
+            )
 
     def replace_placeholders(self, prompt: str, meta: dict) -> str:
         """Replace ``{key}`` placeholders in the prompt with values from ``meta``.

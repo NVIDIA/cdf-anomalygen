@@ -10,11 +10,11 @@
 #   uv pip show cosmos-framework   # then compare Requires against requirements.txt
 #
 # Its optional `train` extra — which we do NOT request — additionally pins
-# `multi-storage-client==0.44.0`, against the 1.0.1 in requirements.txt. Everything its easy_io MSC
-# backend touches still exists in 1.0.1: StorageClient, StorageClientConfig (+ .read_msc_config,
+# `multi-storage-client==0.44.0`, against the 1.1.0 in requirements.txt. Everything its easy_io MSC
+# backend touches still exists in 1.1.0: StorageClient, StorageClientConfig (+ .read_msc_config,
 # .from_dict), types.Range, types.RetryableError, and the client's read/write/list/info/is_file/
 # delete/download_file/upload_file. Re-verify that surface before bumping msc again.
 #
 # Pinned to an exact commit for reproducibility. To bump: pick the new upstream SHA and edit the
 # `@<sha>` below — see CONTRIBUTING.md, "Updating the cosmos-framework pin".
-cosmos-framework @ git+https://github.com/NVIDIA/cosmos-framework.git@a904d2d36b774a51dd06ff9ff906816b1a04f579
+cosmos-framework @ git+https://github.com/NVIDIA/cosmos-framework.git@cf5d68c00d97ccd2480a2320ed652b92dec63102

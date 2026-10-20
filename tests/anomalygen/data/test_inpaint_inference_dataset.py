@@ -9,6 +9,7 @@ validation-loader helpers it hosts: ``_val_collate``, ``_build_val_batch_indices
 """
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -21,16 +22,17 @@ from anomalygen.configs.texture.constants import (
     DEFAULT_MAX_INSTANCES,
     DEFAULT_NUM_STEPS,
 )
+from anomalygen.data.crop_geometry import input_size_spec_from_config, plan_for
 from anomalygen.data.inpaint_inference_dataset import (
     SEED_OUTPUT_STRIDE,
     SEED_RECORD_STRIDE,
     InpaintInferenceDataset,
     _build_val_batch_indices,
-    _count_mask_instances,
     _sort_records_by_instance_num,
     _val_collate,
     get_inpaint_val_dataloader,
 )
+from anomalygen.data.utils import MASK_FG_THRESHOLD, sample_token_count
 
 
 def _save_image(path, size=(32, 32)):
@@ -52,36 +54,60 @@ def _write_jsonl(path, records):
 # --- module-level helpers ------------------------------------------------------------------------
 
 
-def test_count_mask_instances_counts_components():
-    mask = Image.fromarray(np.zeros((40, 40), np.uint8), mode="L")
-    arr = np.array(mask)
-    arr[2:7, 2:7] = 255
-    arr[30:35, 30:35] = 255  # second, well-separated blob
-    two = Image.fromarray(arr, mode="L")
-    assert _count_mask_instances(two) == 2
-    assert _count_mask_instances(mask) == 0  # empty -> no foreground components
-
-
-def test_count_mask_instances_counts_nonbinary_components():
-    arr = np.zeros((40, 40), np.uint8)
-    arr[2:7, 2:7] = 255
-    arr[20:25, 20:25] = 128  # a mid-grey (non-binary) blob still counts as foreground
-    mask = Image.fromarray(arr, mode="L")
-    # Any non-zero pixel is foreground for connected-components, so both blobs count.
-    assert _count_mask_instances(mask) == 2
-
-
 def test_sort_records_by_instance_num(tmp_path):
     one = tmp_path / "one.png"
     two = tmp_path / "two.png"
     _save_mask(one, blobs=[(2, 2)])
     _save_mask(two, blobs=[(2, 2), (20, 20)])
 
-    records = [{"mask_filename": str(two)}, {"mask_filename": str(one)}]
-    ordered = _sort_records_by_instance_num(records, resolve_mask_path=lambda p: p)
-    # Ascending by instance count: the single-blob record comes first.
-    assert ordered[0]["mask_filename"] == str(one)
-    assert ordered[1]["mask_filename"] == str(two)
+    img = tmp_path / "img.png"
+    _save_image(img, size=(32, 32))
+    records = [
+        {"index": 0, "image_filename": str(img), "mask_filename": str(two)},
+        {"index": 1, "image_filename": str(img), "mask_filename": str(one)},
+    ]
+    ordered, scans = _sort_records_by_instance_num(records, lambda p: p, lambda p: p)
+    # Ascending by instance count: the single-blob record comes first. Each scan carries the mask
+    # size and the instance bboxes the validation loader plans its token bound from.
+    assert [rec["mask_filename"] for rec in ordered] == [str(one), str(two)]
+    assert [len(scan.bboxes) for scan in scans] == [1, 2]
+    assert scans[0].size == (32, 32) and scans[0].bboxes == [(2, 2, 6, 6)]
+
+
+def test_sort_counts_the_instances_generation_splits_not_the_components(tmp_path):
+    # Past iteration_generation_max_instance the splitter clusters components, so generation runs
+    # at the cluster count; the sort and the token bound must see that count, not the raw one.
+    img, msk = tmp_path / "img.png", tmp_path / "m.png"
+    _save_image(img)
+    _save_mask(msk, blobs=[(2, 2), (2, 25), (25, 2)])
+    records = [
+        {"index": 0, "image_filename": str(img), "mask_filename": str(msk), "iteration_generation_max_instance": 2}
+    ]
+    _, scans = _sort_records_by_instance_num(records, lambda p: p, lambda p: p)
+    assert len(scans[0].bboxes) == 2
+
+
+def test_sort_records_by_instance_num_rejects_a_mismatched_pair(tmp_path):
+    """The size check rides along with the decode this pass already does."""
+    img, msk = tmp_path / "img.png", tmp_path / "m.png"
+    _save_image(img, size=(64, 64))
+    _save_mask(msk, blobs=[(2, 2)], size=32)
+    records = [{"index": 0, "image_filename": str(img), "mask_filename": str(msk)}]
+    with pytest.raises(ValueError):
+        _sort_records_by_instance_num(records, lambda p: p, lambda p: p)
+
+
+def test_sort_records_by_instance_num_rejects_a_mask_with_no_instances(tmp_path):
+    """A mask whose pixels all sit under the foreground cut has nothing to inpaint, so generation would
+    return the input untouched and save it as a result. Refuse it up front, naming the threshold."""
+    img, msk = tmp_path / "img.png", tmp_path / "m.png"
+    _save_image(img, size=(32, 32))
+    arr = np.zeros((32, 32), np.uint8)
+    arr[2:7, 2:7] = 1  # a blob, but under the cut
+    Image.fromarray(arr, mode="L").save(msk)
+    records = [{"index": 7, "image_filename": str(img), "mask_filename": str(msk)}]
+    with pytest.raises(ValueError, match=rf"index=7.*no defect pixels.*>= {MASK_FG_THRESHOLD}"):
+        _sort_records_by_instance_num(records, lambda p: p, lambda p: p)
 
 
 # --- InpaintInferenceDataset ---------------------------------------------------------------------
@@ -129,11 +155,46 @@ def test_dataset_fills_defaults_and_sorts(tmp_path):
     assert rec["seed"] == 1 + 1 * SEED_RECORD_STRIDE
     assert rec["num_generated_images"] == 1
     assert rec["iteration_generation_max_instance"] == DEFAULT_MAX_INSTANCES
-    assert rec["crop_and_paste"] is True
     assert rec["crop_ratio"] == DEFAULT_CROP_RATIO
     assert rec["poisson_blend"] is False
     # index defaults to original line position (assigned before the sort).
     assert set(r["index"] for r in ds.input_data) == {0, 1}
+
+
+@pytest.mark.parametrize(
+    "bad_ratio, message",
+    [
+        (None, "must be a number"),
+        ("none", "must be a number"),
+        ("None", "must be a number"),
+        ("", "must be a number"),
+        ("wide", "must be a number"),
+        ("nan", "must be a finite number >= 1"),
+        ("inf", "must be a finite number >= 1"),
+        (0, "must be a finite number >= 1"),
+        (-1, "must be a finite number >= 1"),
+        (0.5, "must be a finite number >= 1"),
+    ],
+)
+def test_dataset_rejects_a_crop_ratio_that_cannot_frame_a_window(tmp_path, bad_ratio, message):
+    # crop_ratio is the only window request. A non-number has no meaning, nan slips through the band
+    # clamp, and a ratio under 1 asks for a window smaller than the defect: fail loudly rather than
+    # silently substituting some other framing.
+    img, mask = tmp_path / "img.png", tmp_path / "m.png"
+    _save_image(img)
+    _save_mask(mask, blobs=[(2, 2)])
+    jsonl = tmp_path / "cases.jsonl"
+    _write_jsonl(
+        jsonl,
+        [{"image_filename": str(img), "mask_filename": str(mask), "anomaly_type": "t+d", "crop_ratio": bad_ratio}],
+    )
+    with pytest.raises(ValueError, match=f"crop_ratio {message}"):
+        InpaintInferenceDataset(
+            jsonl.as_posix(),
+            default_guidance=DEFAULT_GUIDANCE,
+            default_num_steps=DEFAULT_NUM_STEPS,
+            default_max_instances=DEFAULT_MAX_INSTANCES,
+        )
 
 
 def test_dataset_getitem_loads_pil_pair(tmp_path):
@@ -270,7 +331,13 @@ def test_generate_rejects_records_outside_the_seed_envelope():
     # The two counts come straight from user JSONL, so the collisions characterised above are
     # reachable by configuration alone; generate.py must refuse them up front rather than emit
     # duplicate noise. Imported lazily: importing generate.py runs the framework's init_script.
-    from anomalygen.scripts.texture.generate import _validate_seed_envelope
+    # init_script also turns autograd off for the whole interpreter, which would break any later
+    # test that backpropagates, so restore the flag.
+    grad_was_enabled = torch.is_grad_enabled()
+    try:
+        from anomalygen.scripts.texture.generate import _validate_seed_envelope
+    finally:
+        torch.set_grad_enabled(grad_was_enabled)
 
     ok = [{"index": 0, "num_generated_images": _MAX_OUTPUTS_PER_TESTCASE, "iteration_generation_max_instance": 1}]
     assert _validate_seed_envelope(ok) is None  # at the limit is fine
@@ -297,31 +364,22 @@ def test_val_collate_index_is_size_inferable_tensor():
 # --- _build_val_batch_indices ------------------------------------------------------------------------
 
 
-def _recs(specs):
-    # specs: list of (guidance, shift-or-None); index = position.
-    out = []
-    for i, (g, s) in enumerate(specs):
-        r = {"index": i, "guidance": g}
-        if s is not None:
-            r["shift"] = s
-        out.append(r)
-    return out
+def _recs(guidances):
+    # index = position in the list; num_steps is always present on a dataset record (a default).
+    return [{"index": i, "guidance": g, "num_steps": DEFAULT_NUM_STEPS} for i, g in enumerate(guidances)]
 
 
-def test_plan_batches_are_guidance_shift_homogeneous():
-    recs = _recs([(6.0, None), (6.0, None), (7.0, None), (7.0, None)])
-    plan = _build_val_batch_indices(recs, world_size=1, rank=0, batch_size=4, default_shift=5.0)
+def test_plan_batches_are_guidance_homogeneous():
+    recs = _recs([6.0, 6.0, 7.0, 7.0])
+    plan = _build_val_batch_indices(recs, world_size=1, rank=0, batch_size=4)
     for batch in plan:
-        keys = {(recs[i]["guidance"], recs[i].get("shift", 5.0)) for i in batch}
-        assert len(keys) == 1  # one (guidance, shift) per batch
+        assert len({recs[i]["guidance"] for i in batch}) == 1  # one guidance per batch
 
 
 def test_plan_equal_batch_count_across_ranks_and_full_coverage():
-    recs = _recs([(6.0, None)] * 15)
+    recs = _recs([6.0] * 15)
     world = 4
-    plans = [
-        _build_val_batch_indices(recs, world_size=world, rank=r, batch_size=4, default_shift=5.0) for r in range(world)
-    ]
+    plans = [_build_val_batch_indices(recs, world_size=world, rank=r, batch_size=4) for r in range(world)]
     counts = [len(p) for p in plans]
     assert len(set(counts)) == 1  # every rank runs the same number of batches (FSDP lockstep)
     seen = set()
@@ -332,8 +390,8 @@ def test_plan_equal_batch_count_across_ranks_and_full_coverage():
 
 
 def test_plan_small_group_pads_to_world_multiple():
-    recs = _recs([(6.0, None)])  # single record, 8 ranks
-    plans = [_build_val_batch_indices(recs, world_size=8, rank=r, batch_size=4, default_shift=5.0) for r in range(8)]
+    recs = _recs([6.0])  # single record, 8 ranks
+    plans = [_build_val_batch_indices(recs, world_size=8, rank=r, batch_size=4) for r in range(8)]
     assert all(len(p) == 1 and p[0] == [0] for p in plans)  # each rank gets the (repeated) sole record
 
 
@@ -362,9 +420,196 @@ def test_get_inpaint_val_dataloader_builds_batches(tmp_path):
             for i in range(5)
         ],
     )
-    dl = get_inpaint_val_dataloader(str(jsonl), val_batch_size=2, shift=5.0, num_workers=0)
+    dl = get_inpaint_val_dataloader(str(jsonl), val_batch_size=2, num_workers=0)
     batches = list(dl)
     # 5 records, batch_size 2 -> 3 batches (2, 2, 1); collate yields dict-of-lists incl loaded PIL.
     assert sum(len(b["anomaly_type"]) for b in batches) == 5
     assert "image" in batches[0] and "index" in batches[0]
     assert all(len(b["anomaly_type"]) <= 2 for b in batches)
+
+
+# The default planner geometry, as a model's diffusion_expert_config would carry it.
+_DEC = SimpleNamespace(
+    input_size_ladder=(256, 512, 1024, 1536), crop_mode="scale", crop_ratio_range=(1.5, 2.5), inference_scale=1.0
+)
+
+
+def _val_records(img, msk, n):
+    return [
+        {
+            "index": i,
+            "image_filename": str(img),
+            "mask_filename": str(msk),
+            "anomaly_type": "t+d",
+            "guidance": DEFAULT_GUIDANCE,
+            "num_steps": DEFAULT_NUM_STEPS,
+            "iteration_generation_max_instance": 1,
+        }
+        for i in range(n)
+    ]
+
+
+def test_the_validation_batch_is_cut_to_the_token_budget(tmp_path):
+    # Batches are cut by count. A batch of defects planned at the top of the ladder would pack many
+    # times the tokens of a training step into one forward, so the count shrinks until the heaviest
+    # possible forward fits the budget: one 1536 px input is already most of it.
+    img, msk = tmp_path / "img.png", tmp_path / "msk.png"
+    _save_image(img, size=(2048, 2048))
+    arr = np.zeros((2048, 2048), np.uint8)
+    arr[200:1200, 200:1200] = 255  # a 1000 px defect plans at 1536
+    Image.fromarray(arr, mode="L").save(msk)
+    jsonl = tmp_path / "testcase.jsonl"
+    _write_jsonl(jsonl, _val_records(img, msk, 4))
+    dl = get_inpaint_val_dataloader(
+        str(jsonl), val_batch_size=4, num_workers=0, token_budget=5120, diffusion_expert_config=_DEC
+    )
+    assert [len(b) for b in dl.batch_sampler] == [1, 1, 1, 1]
+
+
+def test_small_defects_keep_the_requested_validation_batch_size(tmp_path):
+    img, msk = tmp_path / "img.png", tmp_path / "msk.png"
+    _save_image(img)
+    _save_mask(msk, blobs=[(8, 8)])
+    jsonl = tmp_path / "testcase.jsonl"
+    _write_jsonl(jsonl, _val_records(img, msk, 4))
+    dl = get_inpaint_val_dataloader(
+        str(jsonl), val_batch_size=4, num_workers=0, token_budget=5120, diffusion_expert_config=_DEC
+    )
+    assert [len(b) for b in dl.batch_sampler] == [4]
+
+
+def test_the_token_bound_comes_from_the_instances_not_the_union_bbox(tmp_path):
+    """A union bbox can plan a LIGHTER window than one of its instances: the shared scale shrinks on
+    the wide axis and the other axis snaps down with it. The bound must come from the instances
+    generation will actually cut, through the call generation makes."""
+    img, msk = tmp_path / "img.png", tmp_path / "msk.png"
+    _save_image(img, size=(4000, 4000))
+    arr = np.zeros((4000, 4000), np.uint8)
+    arr[1000:2000, 500:1500] = 255  # a 1000 px square instance
+    arr[1000:1010, 3000:3510] = 255  # a small far-off instance: the union bbox is 3010 x 1000
+    Image.fromarray(arr, mode="L").save(msk)
+    jsonl = tmp_path / "testcase.jsonl"
+    _write_jsonl(
+        jsonl, [{"image_filename": str(img), "mask_filename": str(msk), "anomaly_type": "t+d", "crop_ratio": 2.5}]
+    )
+    spec = input_size_spec_from_config(_DEC)
+
+    def tokens(bbox):
+        plan = plan_for(spec, bbox, 4000, 4000, crop_ratio=2.5, anomaly_name="t+d")
+        return sample_token_count(plan.input_w, plan.input_h)
+
+    assert tokens((500, 1000, 3509, 1999)) < tokens((500, 1000, 1499, 1999))  # the union under-counts
+    assert InpaintInferenceDataset(str(jsonl)).planned_tokens(spec) == [tokens((500, 1000, 1499, 1999))]
+
+
+def test_dataset_rejects_a_testcase_whose_mask_size_differs_from_its_image(tmp_path):
+    # AMP repairs its own output (roi_place._verify_and_resize_jsonl); a hand-written JSONL is not.
+    img, mask = tmp_path / "img.png", tmp_path / "m.png"
+    _save_image(img, size=(32, 32))
+    _save_mask(mask, blobs=[(2, 2)], size=64)
+    jsonl = tmp_path / "cases.jsonl"
+    _write_jsonl(jsonl, [{"image_filename": str(img), "mask_filename": str(mask), "anomaly_type": "t+d"}])
+
+    with pytest.raises(ValueError, match="image/mask size mismatch"):
+        InpaintInferenceDataset(jsonl.as_posix())
+
+
+def test_dataset_accepts_a_matching_pair(tmp_path):
+    img, mask = tmp_path / "img.png", tmp_path / "m.png"
+    _save_image(img, size=(32, 32))
+    _save_mask(mask, blobs=[(2, 2)], size=32)
+    jsonl = tmp_path / "cases.jsonl"
+    _write_jsonl(jsonl, [{"image_filename": str(img), "mask_filename": str(mask), "anomaly_type": "t+d"}])
+
+    assert len(InpaintInferenceDataset(jsonl.as_posix())) == 1
+
+
+# --- removed per-record keys ---------------------------------------------------------------------
+
+
+def _jsonl_with_num_steps(tmp_path, first, second) -> str:
+    """A two-record testcase file differing only in ``num_steps``."""
+    img, m_one, m_two = tmp_path / "i.png", tmp_path / "m1.png", tmp_path / "m2.png"
+    _save_image(img)
+    _save_mask(m_one, blobs=[(2, 2)])
+    _save_mask(m_two, blobs=[(2, 2), (20, 20)])
+    base = {"image_filename": str(img), "anomaly_type": "t+d"}
+    jsonl = tmp_path / "steps.jsonl"
+    _write_jsonl(
+        jsonl,
+        [
+            {**base, "mask_filename": str(m_one), "num_steps": first},
+            {**base, "mask_filename": str(m_two), "num_steps": second},
+        ],
+    )
+    return jsonl.as_posix()
+
+
+def _dataset_with(tmp_path, extra_first=None, extra_second=None, same_mask=False):
+    """The two-record fixture, with extra keys merged into each record.
+
+    ``same_mask`` points both records at the same mask, so they differ only by ``extra_*``.
+    """
+    img, m_one, m_two = tmp_path / "i.png", tmp_path / "m1.png", tmp_path / "m2.png"
+    _save_image(img)
+    _save_mask(m_one, blobs=[(2, 2)])
+    _save_mask(m_two, blobs=[(2, 2), (20, 20)])
+    base = {"image_filename": str(img), "anomaly_type": "t+d"}
+    second_mask = m_one if same_mask else m_two
+    jsonl = tmp_path / "tc.jsonl"
+    _write_jsonl(
+        jsonl,
+        [
+            {**base, "mask_filename": str(m_one), **(extra_first or {})},
+            {**base, "mask_filename": str(second_mask), **(extra_second or {})},
+        ],
+    )
+    return InpaintInferenceDataset(
+        jsonl.as_posix(),
+        default_guidance=DEFAULT_GUIDANCE,
+        default_num_steps=DEFAULT_NUM_STEPS,
+        default_max_instances=DEFAULT_MAX_INSTANCES,
+    )
+
+
+_IGNORED = pytest.mark.parametrize("extra", [{"shift": 5.0}, {"crop_and_paste": True}], ids=["shift", "crop_and_paste"])
+
+
+@_IGNORED
+def test_an_ignored_per_record_key_is_dropped_not_carried(tmp_path, extra, loguru_lines):
+    """Shift comes from the recipe and crop-and-paste is always on, so both are ignored — and must
+    not linger: ``_val_collate`` keys off the first record and indexes the rest, so a key on only
+    some of them raises ``KeyError``. Dropping is said out loud."""
+    (key,) = extra
+    ds = _dataset_with(tmp_path, extra_first=extra)
+    assert all(key not in rec for rec in ds.input_data)
+    assert any(f"set {key!r}" in ln for ln in loguru_lines)
+
+
+@_IGNORED
+def test_a_partially_present_ignored_key_still_collates(tmp_path, extra):
+    """A key on one record only would KeyError in _val_collate if it survived."""
+    (key,) = extra
+    ds = _dataset_with(tmp_path, extra_first=extra)
+    batch = _val_collate(list(ds.input_data))
+    assert key not in batch
+
+
+def test_records_differing_only_in_shift_are_caught_as_duplicates(tmp_path):
+    """The drop has to run before the duplicate check, not after.
+
+    ``shift`` is stripped, so two records distinguished only by it are the same testcase. Dropping
+    after the check would let them through and generate it twice.
+    """
+    with pytest.raises(ValueError, match="[Dd]uplicate"):
+        _dataset_with(tmp_path, extra_first={"shift": 5.0}, extra_second={"shift": 7.0}, same_mask=True)
+
+
+def test_mixed_num_steps_are_batched_apart_for_validation(tmp_path):
+    """A batch mixing step counts would put the ranks on different timestep grids and desynchronise
+    the CFG gate, so the grouping keys on num_steps as well as guidance."""
+    jsonl = _jsonl_with_num_steps(tmp_path, 20, 35)
+    ds = InpaintInferenceDataset(jsonl, default_guidance=DEFAULT_GUIDANCE, default_num_steps=DEFAULT_NUM_STEPS)
+    batches = _build_val_batch_indices(ds.input_data, world_size=1, rank=0, batch_size=8)
+    assert sorted(ds.input_data[b[0]]["num_steps"] for b in batches) == [20, 35]
+    assert all(len({ds.input_data[i]["num_steps"] for i in b}) == 1 for b in batches)

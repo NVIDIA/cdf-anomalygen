@@ -329,6 +329,7 @@ class PipelineStage(ABC):
         return dep_hash
 
     def save_visualization(self, ctx):
+        # Optional hook: a stage with nothing to draw keeps this default.
         pass
 
 
@@ -415,7 +416,7 @@ class TemplatePreparationStage(PipelineStage):
             mask = masks[0].astype(np.uint8)
 
             # --- Compute new bbox from mask ---
-            ys, xs = np.where(mask > 0)
+            ys, xs = np.nonzero(mask > 0)
             if len(xs) == 0 or len(ys) == 0:
                 refined_boxes.append(box)  # fallback to original
                 continue
@@ -544,7 +545,7 @@ class ProposalGenerationStage(PipelineStage):
                 for m_idx, m in enumerate(masks):
                     if m is None or m.sum() == 0:
                         continue
-                    ys, xs = np.where(m > 0)
+                    ys, xs = np.nonzero(m > 0)
                     if len(xs) == 0 or len(ys) == 0:
                         continue
                     x0, y0, x1, y1 = xs.min(), ys.min(), xs.max(), ys.max()
@@ -571,7 +572,7 @@ class ProposalGenerationStage(PipelineStage):
             # Generate candidate points from high-similarity regions
             top_percent = 100 * (1.0 - self.proposal_similarity_tol)
             thresh = np.percentile(sim_np, top_percent)
-            ys, xs = np.where(sim_np >= thresh)
+            ys, xs = np.nonzero(sim_np >= thresh)
             if len(xs) == 0:
                 continue
 

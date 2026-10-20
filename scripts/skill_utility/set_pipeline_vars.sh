@@ -6,15 +6,27 @@
 #
 # SOURCE it; do not execute it — an executed copy sets the variables in a child shell that then exits:
 #
-#   source scripts/skill_utility/set_pipeline_vars.sh --name phone_screen --num_sdg 25
-#   source scripts/skill_utility/set_pipeline_vars.sh --name pcb --num_sdg 40 --num_gpus 8 --num_search_run 5
+#   source scripts/skill_utility/set_pipeline_vars.sh --name phone_screen \
+#       --dataset_dir datasets/phone_screen --num_sdg 25
+#   source scripts/skill_utility/set_pipeline_vars.sh --name uc1pega-opus5-e2e \
+#       --dataset_dir datasets/uc1pega --num_sdg 40 --num_gpus 8 --num_search_run 5
+#
+# The second example is the normal shape, not an odd one: the experiment label and the dataset name
+# differ, which is why one is never derived from the other.
 #
 # Re-source it in every shell that needs the variables. Sourcing is idempotent and cheap (no I/O), and
 # a fresh shell — a new terminal, a new tool call, a new CI step — does not inherit them.
 #
 # Options (defaults match the Inputs table in skills/anomalygen/SKILL.md):
-#   --name             required  dataset/run identifier; names the dataset dirs, recipe, run dir and log
-#   --num_sdg          required  samples to generate; in finetune_only it sizes the validation AMP set
+#   --name             required  EXPERIMENT LABEL ONLY. It names the recipe, the run dir, the logs and
+#                      the derived validation_*/generation_* mask-set dirs, and says nothing about where
+#                      the dataset lives — that is --dataset_dir
+#   --dataset_dir      required  dataset root in the Step 1 contract layout. It comes from the caller and
+#                      is NEVER derived from --name: labels are routinely 'uc1pega-opus5-e2e' while the
+#                      dataset is 'datasets/uc1pega', so a "datasets/${NAME}" default would be wrong in
+#                      the normal case rather than the exceptional one. Existence is NOT checked here —
+#                      that is the Step 1 dataset gate's job, and this script stays free of I/O
+#   --num_sdg          required  samples to generate; in finetune_only it sizes the validation mask set
 #   --num_gpus         1         --nproc_per_node for fine-tuning and generation
 #   --num_search_run   3         Step 6 search rounds; 0 = clone-only
 #   --task             texture_ft  recipe task_type; picks ${SCRIPTS} and the experiment name
@@ -37,20 +49,24 @@
 
 if [[ "${BASH_SOURCE[0]}" = "$0" ]]; then
   printf 'set_pipeline_vars.sh: source this script, do not execute it:\n' >&2
-  printf '  source %s --name <name> --num_sdg <n>\n' "$0" >&2
+  printf '  source %s --name <label> --dataset_dir <dir> --num_sdg <n>\n' "$0" >&2
   exit 64
 fi
 
 _ag_vars() {
-  local name="" num_sdg="" num_gpus=1 num_search_run=3 task=texture_ft job_name=""
+  local name="" dataset_dir="" num_sdg=""
+  local num_gpus=1 num_search_run=3 task=texture_ft job_name=""
 
   # Provenance per variable, recorded as the options are parsed — by the time the values are printed a
   # defaulted and an explicitly-passed one are indistinguishable. Unlisted variables read 'derived'.
   local -A prov=()
 
+  local opt
   while [[ $# -gt 0 ]]; do
-    case "$1" in
+    opt="$1"
+    case "$opt" in
       --name)           name="${2-}";           prov[NAME]=set;           shift 2 || return 64 ;;
+      --dataset_dir)    dataset_dir="${2-}";    prov[DATASET_DIR]=set;    shift 2 || return 64 ;;
       --num_sdg)        num_sdg="${2-}";        prov[NUM_SDG]=set;        shift 2 || return 64 ;;
       --num_gpus)       num_gpus="${2-}";       prov[NUM_GPUS]=set;       shift 2 || return 64 ;;
       --num_search_run) num_search_run="${2-}"; prov[NUM_SEARCH_RUN]=set; shift 2 || return 64 ;;
@@ -60,13 +76,15 @@ _ag_vars() {
         awk '/^#!/ {next} /SPDX-/ {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "${BASH_SOURCE[0]}"
         return 64 ;;
       *)
-        printf 'set_pipeline_vars.sh: unknown option %q (see --help)\n' "$1" >&2
+        printf 'set_pipeline_vars.sh: unknown option %q (see --help)\n' "$opt" >&2
         return 64 ;;
     esac
   done
 
   # ${NAME} and ${TASK} reach shell command lines and path expansions below, so validate before use —
   # reject, never sanitize. A silently rewritten name would point every later step at the wrong dirs.
+  # ${DATASET_DIR} is exempt from this charset by design: it is a path, and a legitimate dataset root
+  # can live anywhere. It gets the protection paths get instead — quoted at every expansion downstream.
   local ident='^[A-Za-z0-9][A-Za-z0-9._-]*$'
   if ! [[ $name =~ $ident ]]; then
     printf 'set_pipeline_vars.sh: invalid --name %q: letters/digits/._- only, must start alphanumeric\n' \
@@ -82,6 +100,16 @@ _ag_vars() {
   if ! [[ $job_name =~ $ident ]]; then
     printf 'set_pipeline_vars.sh: invalid --job_name %q: letters/digits/._- only, must start alphanumeric\n' \
       "$job_name" >&2
+    return 64
+  fi
+
+  # Required with no fallback: --dataset_dir is never derived from --name (see the header — the label
+  # equals the dataset name only in the exceptional case), and a guessed "datasets/${NAME}" would hand
+  # Step 5's and Step 6's --real_root a wrong reference on every run where they differ. A missing value
+  # must stop the caller, not be guessed at.
+  if [[ -z $dataset_dir ]]; then
+    printf 'set_pipeline_vars.sh: --dataset_dir is required; it is never derived from --name (%q is only an experiment label)\n' \
+      "$name" >&2
     return 64
   fi
 
@@ -115,7 +143,10 @@ _ag_vars() {
   NUM_SDG="$num_sdg"
   NUM_GPUS="$num_gpus"
   NUM_SEARCH_RUN="$num_search_run"
-  DATASET_DIR="datasets/${NAME}"
+  DATASET_DIR="$dataset_dir"
+  # Path derivation only — no existence check for either of these. A wrong DATASET_DIR is the Step 1
+  # dataset gate's to catch one step later; DEFECT_SPEC has a single consumer, the amp backend, and
+  # under the default amg the file may legitimately not exist and nothing reads it.
   DEFECT_SPEC="${DATASET_DIR}/defect_spec.jsonl"
   RECIPE="ag_config/exp_${TASK}_${NAME}.yaml"
   VAL_DIR="datasets/validation_${NAME}"

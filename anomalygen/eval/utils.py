@@ -102,9 +102,11 @@ def load_generated(
     all_files = sorted(os.listdir(recon_dir))
     generated: Dict[str, Dict[str, List]] = {}
     for key in anomaly_types:
-        # Reconstructed and mask share the filename; prefix match avoids one type's name being a
-        # substring of another's.
-        files = [f for f in all_files if f.startswith(f"{key}_") and f.lower().endswith(IMAGE_EXTS)]
+        # Reconstructed and mask share the filename. Match the whole key (filename minus the trailing
+        # ``_<idx>``, as in ``infer_anomaly_types``) so ``A+b`` does not also take ``A+b_c`` files.
+        files = [
+            f for f in all_files if f.lower().endswith(IMAGE_EXTS) and os.path.splitext(f)[0].rsplit("_", 1)[0] == key
+        ]
         recon, masks, paths, origs = [], [], [], []
         for f in files:
             mask_path = os.path.join(mask_dir, f)

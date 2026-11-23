@@ -81,6 +81,18 @@ def test_load_generated_pairs_recon_with_mask_and_skips_unmatched(tmp_path):
     assert [p.split("/")[-1] for p in out["K+d"]["img_path"]] == ["K+d_00001.png"]
 
 
+def test_load_generated_does_not_mix_types_sharing_a_prefix(tmp_path):
+    gen_root = tmp_path / "gen"
+    for name in ("K+d_00001.png", "K+d_extra_00002.png", "K+d_extra_00003.png"):
+        _write_rgb(gen_root / "reconstructed_image" / name)
+        _write_mask(gen_root / "original_mask" / name)
+
+    out = load_generated(str(gen_root), ["K+d", "K+d_extra"])
+
+    assert [p.split("/")[-1] for p in out["K+d"]["img_path"]] == ["K+d_00001.png"]
+    assert len(out["K+d_extra"]["img_path"]) == 2
+
+
 def test_load_generated_missing_recon_dir_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_generated(str(tmp_path / "nonexistent"), ["K+d"])
